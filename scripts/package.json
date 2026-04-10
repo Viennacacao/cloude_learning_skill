@@ -1,0 +1,13 @@
+{
+  "name": "21tb-cloud-video-learning",
+  "version": "1.0.0",
+  "description": "21tb 时光易学平台自动化学习工具 - 登录获取课表 + 启动课程播放",
+  "scripts": {
+    "login": "node 21tb-login-crawler.js",
+    "launch": "node 21tb-course-launcher.js",
+    "auto": "node 21tb-login-crawler.js --auto"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}
