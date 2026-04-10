@@ -26,7 +26,7 @@
 
 ```bash
 # 1. 克隆（或下载）本 Skill 到本地
-git clone git@github.com:Viennacacao/Cloudlearning-assistant-skill.git
+git clone git@github.com:Viennacacao/cloude_learning_skill.git
 
 # 2. 安装浏览器依赖
 cd cloud-video-learning/scripts
@@ -100,7 +100,7 @@ node 21tb-login-crawler.js -e 你的企业ID -u 用户名 -p 密码 --auto
 
 Agent：
   ✅ 正在登录 21tb 时光易学平台...
-  ✅ 登录成功！企业：lscb  用户：006627
+  ✅ 登录成功！企业：<enterprise_id>  用户：<username>
   ✅ 已获取完整课表（共 54 门课程）
 
   📋 未完成课程列表（14 门）：

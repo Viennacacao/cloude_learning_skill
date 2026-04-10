@@ -13,7 +13,7 @@
  * 用法：
  *   node 21tb-login-crawler.js                    # 交互式（登录后展示课表）
  *   node 21tb-login-crawler.js --auto             # 一键全自动（登录→显示课表→自动进入未完成课程）
- *   node 21tb-login-crawler.js --enterprise lscb --user 006627 --pass Lwm006627
+ *   node 21tb-login-crawler.js --enterprise your_id --user your_user --pass your_password
  *
  * 依赖：npm install puppeteer
  */
@@ -91,10 +91,10 @@ function parseArgs() {
   -h, --help               显示帮助
 
 示例:
-  node 21tb-login-crawler.js -e lscb -u 006627 -p Lwm006627
-  node 21tb-login-crawler.js -e lscb -u 006627 -p Lwm006627 --auto
-  node 21tb-login-crawler.js -e lscb -u 006627 -p Lwm006627 -c "创新方法：组合创新与交叉创新"
-  node 21tb-login-crawler.js -e lscb -u 006627 -p Lwm006627 --auto --auto-advance --json
+  node 21tb-login-crawler.js -e your_id -u your_user -p your_password
+  node 21tb-login-crawler.js -e your_id -u your_user -p your_password --auto
+  node 21tb-login-crawler.js -e your_id -u your_user -p your_password -c "课程名"
+  node 21tb-login-crawler.js -e your_id -u your_user -p your_password --auto --auto-advance --json
         `);
         process.exit(0);
     }
