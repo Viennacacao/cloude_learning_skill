@@ -515,9 +515,17 @@
     addLog('🚀 自动播放已启动', 'success');
     try {
       const comp = getCoursePlayComponent();
-      if (!comp) { addLog('错误：未找到课程组件', 'error'); stopAutoPlay(); return; }
+      if (!comp) {
+        addLog('未找到课程组件，切换到评估监听模式', 'warn');
+        await waitAndHandleEvaluationOnlyMode();
+        return;
+      }
       const courseData = getCourseData(comp);
-      if (!courseData) { addLog('错误：未找到课程数据', 'error'); stopAutoPlay(); return; }
+      if (!courseData) {
+        addLog('未找到课程数据，切换到评估监听模式', 'warn');
+        await waitAndHandleEvaluationOnlyMode();
+        return;
+      }
       const resources = getAllResources(courseData);
       addLog(`课程共 ${resources.length} 个资源`, 'info');
       const finished = resources.filter(r => r.finish).length;
@@ -555,6 +563,28 @@
       console.error('[时光易学助手]', e);
     }
     stopAutoPlay();
+  }
+
+  async function waitAndHandleEvaluationOnlyMode(maxWaitMs = 30 * 60 * 1000) {
+    addLog('⏳ 仅评估模式：等待课程评估页面出现...', 'info');
+    const startAt = Date.now();
+    while (isRunning && (Date.now() - startAt) < maxWaitMs) {
+      if (isCourseEvaluatePage()) {
+        addLog('📝 检测到课程评估页面，开始自动填写...', 'success');
+        const ok = await handleCourseEvaluate();
+        if (ok) {
+          playProgress.courseCompleted = true;
+          playProgress.lastActivityAt = new Date().toISOString();
+          syncHelperApi();
+          addLog('✅ 仅评估模式执行完成', 'success');
+        }
+        break;
+      }
+      await sleep(2000);
+    }
+    if (isRunning && !isCourseEvaluatePage()) {
+      addLog('⚠️ 等待评估页面超时，请手动检查页面状态', 'warn');
+    }
   }
 
   function stopAutoPlay() {
@@ -703,12 +733,29 @@
   }
 
   function isCourseEvaluatePage() {
-    return !!document.querySelector('.course-evaluate-title');
+    return !!(document.querySelector('.course-evaluate') || document.querySelector('.course-evaluate-title'));
   }
 
   async function handleCourseEvaluate() {
     addLog('📝 检测到课程评估页面，开始自动填写...', 'success');
     await sleep(1000);
+    // 优先复用独立评估模块（固定题目、固定答案）
+    try {
+      if (window.__TBH_EVAL_AUTO__ && typeof window.__TBH_EVAL_AUTO__.fillAndSubmit === 'function') {
+        const result = await window.__TBH_EVAL_AUTO__.fillAndSubmit({
+          starRating: 5,
+          choiceOption: 'd',
+          essayAnswer: '很不错，高效，有趣',
+        });
+        if (result && result.success) {
+          addLog('✅ 课程评估已通过 EvalAuto 模块提交', 'success');
+          return true;
+        }
+        addLog(`⚠️ EvalAuto 未成功，转为兜底提交流程：${result?.error || '未知原因'}`, 'warn');
+      }
+    } catch (e) {
+      addLog(`⚠️ EvalAuto 调用异常，转为兜底提交流程：${e.message}`, 'warn');
+    }
     const zeroStar = document.querySelector('.ant-rate .ant-rate-star-zero');
     if (zeroStar) { zeroStar.click(); addLog('⭐ 已完成课程评分（5星）', 'success'); await sleep(500); }
     else { addLog('⭐ 评分星星已全部选中，跳过', 'info'); }
@@ -741,7 +788,7 @@
       let targetBtn = null;
       buttons.forEach(btn => {
         const text = btn.textContent.trim();
-        if (text === 'Submit' || text === '提交') { targetBtn = btn; }
+        if (text === 'Submit' || text === '提交' || text === '提交评估' || text === '确 定' || text === '确定') { targetBtn = btn; }
       });
       if (targetBtn) {
         addLog('📤 正在提交课程评估...', 'info');

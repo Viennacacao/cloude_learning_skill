@@ -101,10 +101,18 @@ module.exports = {
 // ============================================================
 
 /**
- * 检测当前页面是否为评估页面
+ * 检测当前页面或任意 iframe 是否为评估页面
  */
 async function isEvaluationPage(page) {
-  return page.evaluate(() => !!document.querySelector('.course-evaluate'));
+  for (const frame of page.frames()) {
+    try {
+      const onEvalPage = await frame.evaluate(() => !!document.querySelector('.course-evaluate'));
+      if (onEvalPage) return true;
+    } catch (e) {
+      // 忽略跨域 frame 报错
+    }
+  }
+  return false;
 }
 
 /**
@@ -117,7 +125,7 @@ async function waitForEvaluationPage(page, timeout = 60000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     if (await isEvaluationPage(page)) return true;
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 1000));
   }
   return false;
 }
@@ -129,24 +137,39 @@ async function waitForEvaluationPage(page, timeout = 60000) {
  * @returns {Promise<{success: boolean, steps: Object, error?: string}>}
  */
 async function runEvaluationAuto(page, options = {}) {
-  // 先确保 eval-auto 模块已注入
-  const injected = await page.evaluate(() => !!window.__TBH_EVAL_AUTO__);
+  // 查找包含评估内容的 frame
+  let targetFrame = null;
+  for (const frame of page.frames()) {
+    try {
+      const onEvalPage = await frame.evaluate(() => !!document.querySelector('.course-evaluate'));
+      if (onEvalPage) {
+        targetFrame = frame;
+        break;
+      }
+    } catch (e) {}
+  }
+
+  if (!targetFrame) {
+    return { success: false, error: 'Evaluation container (.course-evaluate) not found in any frame' };
+  }
+
+  // 确保 eval-auto 模块已在该 frame 注入
+  const injected = await targetFrame.evaluate(() => !!window.__TBH_EVAL_AUTO__);
   
   if (!injected) {
-    // 手动注入
     const source = loadEvalAutoSource();
-    await page.evaluate((src) => {
+    await targetFrame.evaluate((src) => {
       const s = document.createElement('script');
       s.textContent = src;
-      document.head.appendChild(s);
+      (document.head || document.documentElement).appendChild(s);
       s.remove();
     }, source);
   }
 
   // 执行填写提交
-  return page.evaluate((opts) => {
+  return targetFrame.evaluate((opts) => {
     if (!window.__TBH_EVAL_AUTO__) {
-      return { success: false, error: 'EvalAuto module not available' };
+      return { success: false, error: 'EvalAuto module not available in target frame' };
     }
     return window.__TBH_EVAL_AUTO__.fillAndSubmit(opts);
   }, options);

@@ -109,13 +109,18 @@
     async fillStarRating() {
       this.log('⭐ Step 1: Filling star rating...');
 
-      const rateGroup = document.querySelector('.ant-rate[role="radiogroup"]');
+      // 尝试多种选择器寻找评分容器
+      const rateGroup = document.querySelector('.ant-rate[role="radiogroup"]') || 
+                        document.querySelector('.ant-rate') ||
+                        document.querySelector('[class*="rate"]');
+
       if (!rateGroup) {
         this.log('⚠️ Star rating group not found, skipping.');
         return false;
       }
 
-      const stars = rateGroup.querySelectorAll('.ant-rate-star');
+      // 寻找星星元素
+      const stars = rateGroup.querySelectorAll('.ant-rate-star, [class*="star"]');
       if (stars.length === 0) {
         this.log('⚠️ No star elements found, skipping.');
         return false;
@@ -124,10 +129,12 @@
       const targetIndex = Math.min(EVAL_CONFIG.starRating - 1, stars.length - 1);
       const targetStar = stars[targetIndex];
       
-      // 找到 role=radio 的元素并点击（Ant Design Rate 组件结构）
-      const radioEl = targetStar.querySelector('[role="radio"]') || targetStar;
+      // 找到可点击的元素（Ant Design Rate 结构通常是第一级或内部的 radio/div）
+      const clickableEl = targetStar.querySelector('[role="radio"]') || 
+                          targetStar.querySelector('.ant-rate-star-first') ||
+                          targetStar;
       
-      this._click(radioEl);
+      this._click(clickableEl);
       this.log(`⭐ Rated ${EVAL_CONFIG.starRating} stars (clicked star #${targetIndex + 1})`);
 
       await this.sleep(EVAL_CONFIG.stepDelay);
@@ -140,8 +147,11 @@
     async fillMultipleChoice() {
       this.log(`📝 Step 2: Filling multiple choice (select option "${EVAL_CONFIG.choiceOption.toUpperCase()}")...`);
 
-      // 找到所有选择题的题目容器
-      const questionItems = document.querySelectorAll('.course-test-type-list-item');
+      // 寻找题目容器，尝试多种可能的类名
+      const questionItems = document.querySelectorAll('.course-test-type-list-item') || 
+                            document.querySelectorAll('.course-test-item') ||
+                            document.querySelectorAll('[class*="test-type-list-item"]');
+
       if (questionItems.length === 0) {
         this.log('⚠️ No question items found, skipping multiple choice.');
         return false;
@@ -152,33 +162,52 @@
       for (let i = 0; i < questionItems.length; i++) {
         const item = questionItems[i];
 
-        // 跳过问答题（包含 textarea 的容器）
-        if (item.querySelector('textarea')) {
-          continue;  // 这个留给步骤3处理
+        // 跳过简答题（包含 textarea 或明显标记为简答的容器）
+        if (item.querySelector('textarea') || item.textContent.includes('简答') || item.textContent.includes('论述')) {
+          this.log(`  - Q${i + 1}: Detected as essay/textarea, skipping in MC step.`);
+          continue;
         }
 
-        // 在当前题目中查找目标选项
-        // Ant Design Radio 结构: label.ant-radio-wrapper[label="d"] > span.ant-radio > input
-        const targetLabel = item.querySelector(`.ant-radio-wrapper[label="${EVAL_CONFIG.choiceOption}"]`);
-        
-        if (targetLabel) {
-          this._click(targetLabel);
+        // 寻找选项容器
+        const options = item.querySelectorAll('.ant-radio-wrapper, .ant-checkbox-wrapper, [class*="radio-wrapper"]');
+        if (options.length === 0) {
+          this.log(`  ⚠️ Q${i + 1}: No options found.`);
+          continue;
+        }
+
+        // 目标选项定位逻辑
+        let targetOption = null;
+        const targetText = EVAL_CONFIG.choiceOption.toUpperCase();
+
+        // 1. 根据 label 属性查找 (AntD 常用)
+        targetOption = item.querySelector(`.ant-radio-wrapper[label="${EVAL_CONFIG.choiceOption}"], .ant-radio-wrapper[label="${targetText}"]`);
+
+        // 2. 根据文本内容查找 (A/B/C/D)
+        if (!targetOption) {
+          targetOption = Array.from(options).find(opt => {
+            const text = opt.textContent.trim().toUpperCase();
+            return text === targetText || text.startsWith(targetText + '.') || text.startsWith(targetText + ' ') || text.startsWith(targetText + '、');
+          });
+        }
+
+        // 3. 根据索引 Fallback (D 通常是第 4 个)
+        if (!targetOption && EVAL_CONFIG.choiceOption === 'd' && options.length >= 4) {
+          targetOption = options[3];
+          this.log(`  - Q${i + 1}: Option D not found by text/label, using 4th index fallback.`);
+        } else if (!targetOption && options.length > 0) {
+          // 如果还是没找到，默认选最后一个
+          targetOption = options[options.length - 1];
+          this.log(`  - Q${i + 1}: Target option not found, using last option fallback.`);
+        }
+
+        if (targetOption) {
+          this._click(targetOption);
           filledCount++;
           
           // 获取题目文本（用于日志）
-          const titleEl = item.querySelector('.course-test-type-list-item-title-content');
-          const titleText = titleEl ? titleEl.textContent.trim().substring(0, 40) : `Question #${i + 1}`;
-          this.log(`  ✓ Q${i + 1}: [${titleText}...] → Selected ${EVAL_CONFIG.choiceOption.toUpperCase()}`);
-        } else {
-          this.log(`  ⚠️ Q${i + 1}: Option "${EVAL_CONFIG.choiceOption}" not found, trying fallback.`);
-          
-          // Fallback: 尝试点击第 4 个选项（D 通常排在第 4 位）
-          const allLabels = item.querySelectorAll('.ant-radio-wrapper');
-          if (allLabels.length >= 4) {
-            this._click(allLabels[3]);  // index 3 = D (0-based)
-            filledCount++;
-            this.log(`  ✓ Q${i + 1}: Fallback → clicked 4th option.`);
-          }
+          const titleEl = item.querySelector('.course-test-type-list-item-title-content') || item.querySelector('[class*="title"]');
+          const titleText = titleEl ? titleEl.textContent.trim().substring(0, 30) : `Question #${i + 1}`;
+          this.log(`  ✓ Q${i + 1}: [${titleText}...] → Selected`);
         }
 
         await this.sleep(EVAL_CONFIG.stepDelay);
@@ -192,30 +221,28 @@
      * 步骤3：问答题 — 填写固定答案
      */
     async fillEssayQuestion() {
-      this.log(`📝 Step 3: Filling essay question with fixed answer...`);
+      this.log(`📝 Step 3: Filling essay question...`);
 
-      const textareas = document.querySelectorAll('.course-test-type-list-item textarea.ant-input');
+      // 查找所有可能的文本输入框
+      const textareas = document.querySelectorAll('textarea.ant-input, .course-test-type-list-item textarea, .course-evaluate textarea');
       
       if (textareas.length === 0) {
-        // 也尝试更宽泛的选择器
-        const anyTextarea = document.querySelector('.course-evaluate textarea');
-        if (anyTextarea) {
-          this._fillTextarea(anyTextarea, EVAL_CONFIG.essayAnswer);
-          this.log(`📝 Essay answer filled (fallback selector).`);
-          return true;
-        }
         this.log('⚠️ No essay textarea found, skipping.');
         return false;
       }
 
       for (let i = 0; i < textareas.length; i++) {
         const ta = textareas[i];
+        
+        // 确保元素可见且可用
+        if (ta.offsetParent === null) continue; 
+
         this._fillTextarea(ta, EVAL_CONFIG.essayAnswer);
 
-        // 获取问题标题
-        const parentItem = ta.closest('.course-test-type-list-item');
-        const titleEl = parentItem?.querySelector('.course-test-type-list-item-title-content');
-        const titleText = titleEl ? titleEl.textContent.trim().substring(0, 40) : `Essay #${i + 1}`;
+        // 获取问题标题（可选）
+        const parentItem = ta.closest('.course-test-type-list-item') || ta.closest('[class*="item"]');
+        const titleEl = parentItem?.querySelector('.course-test-type-list-item-title-content') || parentItem?.querySelector('[class*="title"]');
+        const titleText = titleEl ? titleEl.textContent.trim().substring(0, 30) : `Essay #${i + 1}`;
         this.log(`  ✓ Essay ${i + 1}: [${titleText}...] → "${EVAL_CONFIG.essayAnswer}"`);
       }
 
@@ -232,13 +259,18 @@
       // 先等待一小段时间确保所有填写操作完成
       await this.sleep(EVAL_CONFIG.preSubmitDelay);
 
-      // 查找提交按钮 — 优先使用精确选择器
-      let btn = document.querySelector('.course-evaluate-footer .ant-btn-primary');
+      // 查找提交按钮 — 尝试多种可能的类名和文字
+      let btn = document.querySelector('.course-evaluate-footer .ant-btn-primary') ||
+                document.querySelector('.course-evaluate .ant-btn-primary') ||
+                document.querySelector('button.ant-btn-primary');
       
-      // Fallback: 查找任何包含"提交"文字的按钮
+      // Fallback: 查找任何包含"提交"或"确定"文字的按钮
       if (!btn) {
-        const allBtns = Array.from(document.querySelectorAll('button'));
-        btn = allBtns.find(b => b.textContent.trim().includes('提交') || b.textContent.trim().includes('提 交'));
+        const allBtns = Array.from(document.querySelectorAll('button, .ant-btn'));
+        btn = allBtns.find(b => {
+          const text = b.textContent.trim();
+          return text === '提交' || text === '提 交' || text === '确定' || text === '确 定' || text === '提交评估';
+        });
       }
 
       if (!btn) {
@@ -247,6 +279,13 @@
       }
 
       this.log(`🚀 Submit button found: "${btn.textContent.trim()}"`);
+      
+      // 确保按钮是可点击的
+      if (btn.disabled || btn.classList.contains('ant-btn-loading')) {
+        this.log('⚠️ Submit button is disabled or loading, waiting...');
+        await this.sleep(1000);
+      }
+
       this._click(btn);
       this.log('✅ Submit button clicked!');
 
@@ -264,34 +303,37 @@
     async _handlePostSubmitModal() {
       this.log('⏳ Waiting for post-submit modal...');
       
-      // 等待弹窗出现（最多 5 秒）
-      for (let i = 0; i < 10; i++) {
+      // 等待弹窗出现（最多 8 秒，因为后端处理可能慢）
+      for (let i = 0; i < 16; i++) {
         await this.sleep(500);
 
-        // 尝试查找"进入下一步"按钮（评估提交成功后出现）
-        const nextBtn = Array.from(document.querySelectorAll('button'))
-          .find(b => b.textContent.includes('进入下一步'));
+        // 尝试查找"进入下一步"、"下一节"等按钮（评估提交成功后出现）
+        const nextBtn = Array.from(document.querySelectorAll('button, .ant-btn'))
+          .find(b => {
+            const t = b.textContent.trim();
+            return t.includes('进入下一步') || t.includes('下一节') || t.includes('继续学习');
+          });
         
         if (nextBtn) {
-          this.log('✅ Post-submit modal detected, clicking "Next Step"...');
+          this.log(`✅ Post-submit action detected: "${nextBtn.textContent.trim()}", clicking...`);
           this._click(nextBtn);
           await this.sleep(500);
           return true;
         }
 
         // 尝试查找"确定"/"知道了"/"关闭"等确认按钮
-        const confirmBtn = Array.from(document.querySelectorAll('button'))
-          .find(b => /^(确定|知道了|OK|关 闭|关闭)$/.test(b.textContent.trim()));
+        const confirmBtn = Array.from(document.querySelectorAll('button, .ant-btn'))
+          .find(b => /^(确定|知道了|OK|关 闭|关闭|确认)$/.test(b.textContent.trim()));
         
         if (confirmBtn) {
           this.log(`✅ Confirm button found: "${confirmBtn.textContent.trim()}"`);
           this._click(confirmBtn);
           await this.sleep(300);
-          return true;
+          // 继续循环，因为点击确认后可能还会出现"进入下一步"
         }
       }
 
-      this.log('ℹ️ No post-submit modal detected (or already dismissed).');
+      this.log('ℹ️ Post-submit modal handling finished.');
       return false;
     },
 
@@ -398,14 +440,29 @@
      */
     _click(el) {
       if (!el) return;
-      // 使用 MouseEvent 触发，更接近真实用户行为
+      
+      // 1. 触发 MouseEvents
       const rect = el.getBoundingClientRect();
       const x = rect.left + rect.width / 2;
       const y = rect.top + rect.height / 2;
       
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      const options = { bubbles: true, cancelable: true, clientX: x, clientY: y };
+      el.dispatchEvent(new MouseEvent('mousedown', options));
+      el.dispatchEvent(new MouseEvent('mouseup', options));
+      el.dispatchEvent(new MouseEvent('click', options));
+
+      // 2. 对于原生 input/radio，尝试直接调用 click()
+      if (el.tagName === 'INPUT' || (el.querySelector && el.querySelector('input'))) {
+        const input = el.tagName === 'INPUT' ? el : el.querySelector('input');
+        if (input && input !== el) {
+          input.click();
+        }
+      }
+
+      // 3. 最终兜底调用原生 click
+      if (typeof el.click === 'function') {
+        el.click();
+      }
     },
 
     /**
