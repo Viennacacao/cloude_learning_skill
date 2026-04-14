@@ -454,34 +454,61 @@ async function crawlCourseList(page) {
         // 解析文本信息
         const fullText = card.textContent.replace(/\s+/g, ' ').trim();
 
-        // 提取毕业条件
+        // 提取毕业条件 (支持中英文)
         let graduation = '';
-        const gradMatch = fullText.match(/Graduation conditions:\s*(.*?)(?=Progress:|$)/);
-        if (gradMatch) graduation = gradMatch[1].trim();
+        const gradMatch = fullText.match(/(?:Graduation conditions|结业条件)[:：]\s*(.*?)(?=(?:Progress|学习进度)|Compulsory|Elective|Optional|Finish|$)/i);
+        if (gradMatch) {
+          graduation = gradMatch[1].trim();
+        } else {
+          // 备选方案：查找 .mycourse-row 中的内容
+          const rows = card.querySelectorAll('.mycourse-row');
+          for (const row of rows) {
+            if (row.textContent.includes('结业条件') || row.textContent.includes('Graduation')) {
+              graduation = row.textContent.split(/[:：]/)[1]?.trim() || '';
+              break;
+            }
+          }
+        }
 
-        // 提取进度
+        // 提取进度 (支持中英文)
         let progress = '';
         let progressPercent = '';
-        const progressMatch = fullText.match(/Progress:\s*(.*?)(?=Compulsory|Elective|Optional|Finish|$)/);
-        if (progressMatch) progress = progressMatch[1].trim();
+        const progressMatch = fullText.match(/(?:Progress|学习进度)[:：]\s*(.*?)(?=Compulsory|Elective|Optional|Finish|$)/i);
+        if (progressMatch) {
+          progress = progressMatch[1].trim();
+        } else {
+          // 备选方案：查找 .mycourse-row 中的内容
+          const rows = card.querySelectorAll('.mycourse-row');
+          for (const row of rows) {
+            if (row.textContent.includes('学习进度') || row.textContent.includes('Progress')) {
+              progress = row.textContent.split(/[:：]/)[1]?.trim() || '';
+              break;
+            }
+          }
+        }
 
         const percentMatch = fullText.match(/(\d+)%/);
         if (percentMatch) progressPercent = percentMatch[1];
 
-        // 提取课程类型
+        // 提取课程类型 (支持中英文)
         let courseType = '';
-        if (fullText.includes('Compulsory')) courseType = '必修';
-        else if (fullText.includes('Elective')) courseType = '选修';
-        else if (fullText.includes('Optional')) courseType = '可选';
+        if (fullText.includes('Compulsory') || fullText.includes('必修')) courseType = '必修';
+        else if (fullText.includes('Elective') || fullText.includes('选修')) courseType = '选修';
+        else if (fullText.includes('Optional') || fullText.includes('可选')) courseType = '可选';
 
         // 检查是否已完成
-        const isFinished = fullText.includes('Finish') || fullText.includes('Currently completed') || !!finishTag;
+        const isFinished = fullText.includes('Finish') || fullText.includes('Currently completed') || fullText.includes('已完成') || !!finishTag;
+
+        // 判定脚本是否可自动完成 (视频播放 + 课程评估)
+        // 如果进度已经是“课后测试”或“Post-test”，则脚本无法继续
+        const isTestStage = progress.includes('课后测试') || progress.includes('Post-test') || progress.includes('考试');
+        const isCompletable = !isFinished && !isTestStage;
 
         // 提取学分和学时
         let hours = '', credits = '';
-        const hourMatch = fullText.match(/Hour\s*([\d.]+)/);
+        const hourMatch = fullText.match(/(?:Hour|学时)\s*([\d.]+)/i);
         if (hourMatch) hours = hourMatch[1];
-        const creditMatch = fullText.match(/Credit\s*([\d.]+)/);
+        const creditMatch = fullText.match(/(?:Credit|学分)\s*([\d.]+)/i);
         if (creditMatch) credits = creditMatch[1];
 
         return {
@@ -495,6 +522,7 @@ async function crawlCourseList(page) {
           progressPercent,
           courseType,
           isFinished,
+          isCompletable, // 新增：是否可自动完成
           hours,
           credits,
           courseId: link?.dataset?.id || '',
@@ -714,6 +742,8 @@ async function displayCourseTable(page, courses) {
       }
       .tbh-cp-course:hover { background: rgba(255, 255, 255, 0.05); }
       .tbh-cp-course.selected { background: rgba(22, 119, 255, 0.1); }
+      .tbh-cp-course.is-not-completable { opacity: 0.6; cursor: not-allowed; }
+      .tbh-cp-course.is-not-completable .tbh-cp-idx { background: rgba(255, 255, 255, 0.03); color: #444; }
       .tbh-cp-idx {
         width: 32px; height: 32px;
         border-radius: 8px;
@@ -833,6 +863,7 @@ async function displayCourseTable(page, courses) {
 
     const total = courseData.length;
     const finished = courseData.filter(c => c.isFinished).length;
+    const completable = courseData.filter(c => c.isCompletable).length;
     const unfinished = total - finished;
 
     panel.innerHTML = `
@@ -846,11 +877,12 @@ async function displayCourseTable(page, courses) {
       <div class="tbh-cp-stats">
         <div class="tbh-cp-stat"><span class="total">${total}</span>门课程</div>
         <div class="tbh-cp-stat"><span class="finished">${finished}</span>已完成</div>
-        <div class="tbh-cp-stat"><span class="unfinished">${unfinished}</span>未完成</div>
+        <div class="tbh-cp-stat"><span class="unfinished">${unfinished}</span>待学习</div>
+        <div class="tbh-cp-stat"><span class="completable" style="color: #1677ff;">${completable}</span>可自动完成</div>
       </div>
       <div class="tbh-cp-body" id="tbhCpBody">
         ${courseData.map(c => `
-          <div class="tbh-cp-course ${c.isFinished ? 'is-finished' : ''} ${c.progressPercent && !c.isFinished ? 'has-progress' : ''}"
+          <div class="tbh-cp-course ${c.isFinished ? 'is-finished' : ''} ${c.progressPercent && !c.isFinished ? 'has-progress' : ''} ${!c.isCompletable && !c.isFinished ? 'is-not-completable' : ''}"
                data-id="${c.id}" data-index="${c.index}">
             <div class="tbh-cp-idx">${c.isFinished ? '✓' : c.index}</div>
             <div class="tbh-cp-info">
@@ -858,8 +890,9 @@ async function displayCourseTable(page, courses) {
               <div class="tbh-cp-meta">
                 <span>${c.courseType || '其他'}</span>
                 <span>${c.hours ? c.hours + '学时' : ''}</span>
-                <span>${c.graduation || ''}</span>
+                <span title="毕业条件: ${c.graduation || '-'}">${c.graduation || ''}</span>
                 <span class="tag ${c.isFinished ? 'tag-finished' : c.progressPercent ? 'tag-progress' : 'tag-notstarted'}">${c.isFinished ? '已完成' : c.progressPercent ? c.progressPercent + '%' : '未开始'}</span>
+                ${!c.isCompletable && !c.isFinished ? `<span class="tag" style="background: rgba(255,77,79,0.1); color: #ff4d4f;">需手动(课后测试)</span>` : ''}
               </div>
             </div>
             <div class="tbh-cp-progress-bar">
@@ -1035,16 +1068,21 @@ async function saveCourseData(courses) {
 }
 
 /**
- * 一键全自动模式：自动选择第一个未完成的课程
+ * 一键全自动模式：自动选择第一个未完成且可自动完成的课程
  */
 function autoSelectCourse(courses) {
-  const unfinished = courses.filter(c => !c.isFinished);
-  if (unfinished.length === 0) {
-    log('🎉 所有课程都已完成！', 'success');
+  const completable = courses.filter(c => !c.isFinished && c.isCompletable);
+  if (completable.length === 0) {
+    const unfinishedButNotCompletable = courses.filter(c => !c.isFinished && !c.isCompletable);
+    if (unfinishedButNotCompletable.length > 0) {
+      log(`⚠️ 发现 ${unfinishedButNotCompletable.length} 门未完成课程，但它们包含“课后测试”等环节，脚本无法自动完成，已跳过。`, 'warn');
+    } else {
+      log('🎉 所有课程都已完成！', 'success');
+    }
     return [];
   }
-  log(`自动选择第一个未完成课程: ${unfinished[0].title}`, 'info');
-  return [unfinished[0].id];
+  log(`自动选择第一个可自动完成课程: ${completable[0].title}`, 'info');
+  return [completable[0].id];
 }
 
 function matchCoursesByName(courses, names) {
@@ -1412,10 +1450,13 @@ async function main() {
       console.log('  课程列表摘要');
       console.log('══════════════════════════════════════════════════');
       courses.forEach(c => {
-        const status = c.isFinished ? '✅' : c.progressPercent ? '🔄' : '⬜';
+        let status = c.isFinished ? '✅' : c.progressPercent ? '🔄' : '⬜';
+        if (!c.isFinished && !c.isCompletable) status = '⚠️';
         const progress = c.isFinished ? '100%' : c.progressPercent || '0%';
         console.log(`  ${status} ${String(c.index).padStart(2)}. ${c.title}`);
-        console.log(`      类型: ${c.courseType || '-'}  进度: ${progress}  毕业条件: ${c.graduation || '-'}`);
+        let meta = `      类型: ${c.courseType || '-'}  进度: ${progress}  毕业条件: ${c.graduation || '-'}`;
+        if (!c.isFinished && !c.isCompletable) meta += ' [需手动: 课后测试]';
+        console.log(meta);
       });
       console.log('══════════════════════════════════════════════════');
       console.log('');
@@ -1424,6 +1465,8 @@ async function main() {
     // 步骤4：保存课程数据
     await saveCourseData(courses);
     reporter.emit('course_list_saved', { totalCourses, unfinishedCourses: unfinishedCount });
+
+    const completableCourses = courses.filter(c => !c.isFinished && c.isCompletable);
 
     // ====================================================
     // 按课程名直达
@@ -1447,6 +1490,10 @@ async function main() {
           );
         }
 
+        if (!course.isCompletable && !course.isFinished) {
+          log(`⚠️ 课程 "${course.title}" 包含课后测试环节，脚本仅能完成视频播放和评估，后续请手动操作。`, 'warn');
+        }
+
         log(`正在打开指定课程: ${course.title}`, 'info');
         log('将使用 Skill 内置播放助手自动接管课程播放（不依赖油猴）', 'success');
         await openCourseWithEmbeddedPlayer(targetPage, courseUrl, course.title);
@@ -1461,20 +1508,20 @@ async function main() {
         }
       }
 
-      if (opts.autoAdvance && matchedCourses.length === 1 && unfinishedCourses.length > 1) {
-        // 如果只指定了一门课且开了自动推进，在完成这门课后继续推进其余未完成课程
-        const remainingUnfinished = unfinishedCourses.filter(
+      if (opts.autoAdvance && matchedCourses.length === 1 && completableCourses.length > 1) {
+        // 如果只指定了一门课且开了自动推进，在完成这门课后继续推进其余可自动完成的课程
+        const remainingCompletable = completableCourses.filter(
           c => !matchedCourses.some(m => m.id === c.id)
         );
-        if (remainingUnfinished.length > 0) {
-          log(`完成当前课程后，将自动推进剩余 ${remainingUnfinished.length} 门未完成课程`, 'success');
+        if (remainingCompletable.length > 0) {
+          log(`完成当前课程后，将自动推进剩余 ${remainingCompletable.length} 门可自动完成的课程`, 'success');
           reporter.updateState({ phase: 'auto_advancing' });
-          await watchAndAutoAdvance(page, matchedCourses.concat(remainingUnfinished), {
+          await watchAndAutoAdvance(page, matchedCourses.concat(remainingCompletable), {
             onProgress: (course, progress) => {
               // 进度更新已由 watchAndAutoAdvance 内部处理
             },
           });
-          reporter.close('all_done', { completedCount: matchedCourses.length + remainingUnfinished.length });
+          reporter.close('all_done', { completedCount: matchedCourses.length + remainingCompletable.length });
           return;
         }
       }
@@ -1489,9 +1536,14 @@ async function main() {
     // 一键全自动模式
     // ====================================================
     if (opts.auto) {
-      const selectedCourse = unfinishedCourses[0];
+      const selectedCourse = completableCourses[0];
       if (!selectedCourse) {
-        log('所有课程已完成，无需启动', 'success');
+        const anyUnfinished = courses.some(c => !c.isFinished);
+        if (anyUnfinished) {
+          log('发现未完成课程，但它们包含“课后测试”等环节，脚本无法自动完成，已停止一键模式。', 'warn');
+        } else {
+          log('所有课程已完成，无需启动', 'success');
+        }
         reporter.close('all_done', { completedCount: totalCourses });
         return;
       }
@@ -1504,22 +1556,22 @@ async function main() {
         courseTitle: selectedCourse.title,
         courseId: selectedCourse.id,
         courseIndex: 1,
-        totalCourses: unfinishedCount,
+        totalCourses: completableCourses.length,
         status: 'playing',
       });
 
-      if (opts.autoAdvance && unfinishedCount > 1) {
-        log(`自动推进模式已开启，完成当前课程后将自动学习剩余 ${unfinishedCount - 1} 门课程`, 'success');
+      if (opts.autoAdvance && completableCourses.length > 1) {
+        log(`自动推进模式已开启，完成当前课程后将自动学习剩余 ${completableCourses.length - 1} 门可自动完成的课程`, 'success');
         reporter.updateState({ phase: 'auto_advancing' });
 
-        await watchAndAutoAdvance(page, unfinishedCourses, {
+        await watchAndAutoAdvance(page, completableCourses, {
           pollIntervalMs: 30000,
           onProgress: (course, progress) => {
             // 状态已由 watchAndAutoAdvance 内部上报
           },
         });
 
-        reporter.close('all_done', { completedCount: unfinishedCount });
+        reporter.close('all_done', { completedCount: completableCourses.length });
         return;
       }
 
