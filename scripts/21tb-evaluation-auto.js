@@ -167,7 +167,7 @@
           
           // 获取题目文本（用于日志）
           const titleEl = item.querySelector('.course-test-type-list-item-title-content');
-          const titleText = titleEl ? title.textContent.trim().substring(0, 40) : `Question #${i + 1}`;
+          const titleText = titleEl ? titleEl.textContent.trim().substring(0, 40) : `Question #${i + 1}`;
           this.log(`  ✓ Q${i + 1}: [${titleText}...] → Selected ${EVAL_CONFIG.choiceOption.toUpperCase()}`);
         } else {
           this.log(`  ⚠️ Q${i + 1}: Option "${EVAL_CONFIG.choiceOption}" not found, trying fallback.`);
@@ -215,7 +215,7 @@
         // 获取问题标题
         const parentItem = ta.closest('.course-test-type-list-item');
         const titleEl = parentItem?.querySelector('.course-test-type-list-item-title-content');
-        const titleText = titleEl ? title.textContent.trim().substring(0, 40) : `Essay #${i + 1}`;
+        const titleText = titleEl ? titleEl.textContent.trim().substring(0, 40) : `Essay #${i + 1}`;
         this.log(`  ✓ Essay ${i + 1}: [${titleText}...] → "${EVAL_CONFIG.essayAnswer}"`);
       }
 
@@ -328,15 +328,19 @@
       }
 
       try {
+        await this.sleep(EVAL_CONFIG.stepDelay);
         // Step 1: Star Rating
         results.starRating = await this.fillStarRating();
 
+        await this.sleep(EVAL_CONFIG.stepDelay);
         // Step 2: Multiple Choice
         results.multipleChoice = await this.fillMultipleChoice();
 
+        await this.sleep(EVAL_CONFIG.stepDelay);
         // Step 3: Essay Question
         results.essayQuestion = await this.fillEssayQuestion();
 
+        await this.sleep(EVAL_CONFIG.stepDelay);
         // Step 4: Submit
         results.submit = await this.clickSubmit();
 
@@ -430,11 +434,9 @@
 
   // 如果已经在评估页面上，立即尝试自动执行
   // （可选：去掉下面这行的注释即可启用「进入页面后立即自动填写」模式）
-  /*
   if (EvalAuto.isEvaluationPage()) {
     EvalAuto.fillAndSubmit();
   }
-  */
 
   console.log('[TBH-EvalAuto] Module initialized. Call window.__TBH_EVAL_AUTO__.fillAndSubmit() to start.');
 })();

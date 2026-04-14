@@ -953,11 +953,16 @@ async function displayCourseTable(page, courses) {
     document.getElementById('tbhCpClose').addEventListener('click', () => {
       document.getElementById('tbh-course-panel').remove();
       document.getElementById('tbh-course-overlay').remove();
+      // 触发取消事件
+      document.dispatchEvent(new CustomEvent('tbh-cancel-selection'));
     });
+    // 移除遮罩层点击关闭逻辑，防止误点导致面板消失且进程卡死
+    /*
     document.getElementById('tbh-course-overlay').addEventListener('click', () => {
       document.getElementById('tbh-course-panel').remove();
       document.getElementById('tbh-course-overlay').remove();
     });
+    */
 
     // 启动按钮 - 将选择存入 window 供外部读取
     document.getElementById('tbhCpLaunch').addEventListener('click', () => {
@@ -985,10 +990,16 @@ async function waitForUserSelection(page, timeout = 600000) {
       reject(new Error('等待用户选择超时（10分钟）'));
     }, timeout);
 
-    // 监听自定义事件
+    // 监听启动事件
     page.exposeFunction('tbhOnLaunch', (courseIds) => {
       clearTimeout(timer);
       resolve(courseIds);
+    });
+
+    // 监听取消事件
+    page.exposeFunction('tbhOnCancel', () => {
+      clearTimeout(timer);
+      reject(new Error('用户已手动取消课程选择'));
     });
 
     // 注入事件监听
@@ -996,6 +1007,11 @@ async function waitForUserSelection(page, timeout = 600000) {
       document.addEventListener('tbh-launch-courses', (e) => {
         if (typeof window.tbhOnLaunch === 'function') {
           window.tbhOnLaunch(e.detail.courseIds);
+        }
+      });
+      document.addEventListener('tbh-cancel-selection', () => {
+        if (typeof window.tbhOnCancel === 'function') {
+          window.tbhOnCancel();
         }
       });
     });
@@ -1330,6 +1346,21 @@ async function main() {
 
   try {
     const page = (await browser.pages())[0];
+
+    // 桥接浏览器控制台日志到 Node.js 进程
+    page.on('console', async (msg) => {
+      try {
+        const args = await Promise.all(msg.args().map(arg => arg.jsonValue().catch(() => null)));
+        if (args.length > 0) {
+          // 过滤掉 Puppeteer 内部的日志，只显示我们关心的
+          if (typeof args[0] === 'string' && args[0].startsWith('[TBH-EvalAuto]')) {
+            console.log(`[Browser Console] ${args[0]}`, ...args.slice(1));
+          }
+        }
+      } catch (e) {
+        // 忽略执行上下文销毁导致的错误
+      }
+    });
 
     // 设置 User-Agent 避免检测
     await page.setUserAgent(
