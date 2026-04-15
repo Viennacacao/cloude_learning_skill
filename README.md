@@ -37,12 +37,7 @@ npm install
 
 ### 第二步：配置环境变量（首次使用）
 
-```bash
-# 在项目根目录创建 .env 文件
-touch .env
-```
-
-编辑 `.env` 文件，填入你的信息：
+在项目根目录创建 `.env` 文件，填入你的配置。这些变量将控制脚本的行为。
 
 ```bash
 # 21tb 登录凭证（必填）
@@ -57,11 +52,26 @@ ZHIPU_MODEL=glm-4-flash
 ZHIPU_API_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
 
 # 答题行为配置（选填）
-POSTTEST_AI_TIMEOUT_MS=60000
-POSTTEST_REQUIRE_CONFIRM=false
+POSTTEST_AI_TIMEOUT_MS=60000       # AI 单批请求超时（毫秒）
+POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认（false=自动提交，true=低置信度停下）
+POSTTEST_AUTO_SUBMIT_THRESHOLD=0.7  # 自动提交置信度阈值（默认 0.7）
 ```
 
-> **.env 不会上传**：此文件已加入 `.gitignore`，不会同步到 GitHub。
+#### 📌 环境常量说明
+
+| 变量名 | 必填 | 默认值 | 说明 |
+| :--- | :---: | :--- | :--- |
+| `TB_ENTERPRISE_ID` | ✅ | - | 21tb 平台的企业标识（corpCode） |
+| `TB_USER` | ✅ | - | 你的登录账号 |
+| `TB_PASS` | ✅ | - | 你的登录密码 |
+| `ZHIPU_API_KEY` | ❌ | - | 智谱 AI 的 API Key。若不填，课后测试将使用规则兜底（选 D） |
+| `ZHIPU_MODEL` | ❌ | `glm-4-flash` | 使用的 AI 模型版本，建议用 flash 版，速度快且便宜 |
+| `ZHIPU_API_BASE_URL` | ❌ | `https://open.bigmodel.cn/api/...` | 智谱 AI API 地址，通常不需要修改 |
+| `POSTTEST_AI_TIMEOUT_MS` | ❌ | `60000` | AI 答题接口超时时间（毫秒） |
+| `POSTTEST_REQUIRE_CONFIRM` | ❌ | `false` | 若设为 `true`，在 AI 置信度较低或识别不准时会暂停，等待你手动点击提交 |
+| `POSTTEST_AUTO_SUBMIT_THRESHOLD` | ❌ | `0.7` | AI 平均置信度高于此值时且满足提交策略时才自动提交 |
+
+> **安全提示**：`.env` 文件包含你的账号密码和 API Key，**严禁上传到公共代码仓库**。本项目已通过 `.gitignore` 自动忽略该文件。
 
 ### 第三步：开始使用
 
