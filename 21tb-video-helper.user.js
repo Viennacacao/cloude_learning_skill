@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         时光易学视频助手2.0
 // @namespace    https://greasyfork.org/users/cacao
-// @version      2.2.0
+// @version      2.3.0
 // @description  自动播放课程视频、切换章节、设置倍速、自动完成课程评估，并支持 Skill 内嵌自动启动与状态回写
 // @author       cacao
 // @match        *://*/*courseLearning/play*
@@ -26,6 +26,8 @@
     CHECK_INTERVAL_MS: 1000, // 轮询检测间隔
     MAX_RETRIES: 90,         // 最大重试次数
     NEXT_BTN_DELAY_MS: 8000, // 「下一步」按钮出现后等待多久再点击
+    POSTTEST_CONFIRM_TIMEOUT_MS: 15 * 60 * 1000, // 课后测试确认提交超时
+    POSTTEST_BANK_KEY: 'TBH_POSTTEST_BANK_V1',
   };
 
   // ========================
@@ -37,6 +39,22 @@
   let autoStartTriggered = false;
   let lastUrl = window.location.href;
   let checkTimer = null;
+  let postTestConfirmState = {
+    waiting: false,
+    resolver: null,
+    planSummary: null,
+  };
+  let postTestProgress = {
+    active: false,
+    stage: 'idle',
+    summary: '待命',
+    total: 0,
+    resolved: 0,
+    fromBank: 0,
+    fromAI: 0,
+    fromRule: 0,
+    avgConfidence: 0,
+  };
 
   // ========================
   // 进度与状态追踪（供 Node 端读取）
@@ -58,9 +76,11 @@
 
   function syncHelperApi() {
     window.__TBH_HELPER__ = {
-      version: '2.2.0',
+      version: '2.3.0',
       start: startAutoPlay,
       stop: stopAutoPlay,
+      approvePostTestSubmit: () => confirmPostTestSubmit('confirm'),
+      rejectPostTestSubmit: () => confirmPostTestSubmit('cancel'),
       getState: () => ({
         isRunning,
         currentSpeed,
@@ -70,6 +90,11 @@
         autoStart: !!getEmbedConfig().autoStart,
         url: window.location.href,
         progress: { ...playProgress },
+        postTestConfirm: {
+          waiting: postTestConfirmState.waiting,
+          summary: postTestConfirmState.planSummary,
+        },
+        postTestProgress: { ...postTestProgress },
       }),
     };
   }
@@ -220,6 +245,56 @@
         color: #fff;
       }
       .tbh-start-btn.stop:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(255,77,79,0.4); }
+      .tbh-confirm-row {
+        display: none;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .tbh-confirm-row.show {
+        display: flex;
+      }
+      .tbh-posttest-progress {
+        margin-top: 8px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(22, 119, 255, 0.12);
+        border: 1px solid rgba(22, 119, 255, 0.25);
+        font-size: 12px;
+        line-height: 1.5;
+        color: #9dc3ff;
+      }
+      .tbh-posttest-progress.active {
+        background: rgba(250, 173, 20, 0.12);
+        border-color: rgba(250, 173, 20, 0.35);
+        color: #ffd591;
+      }
+      .tbh-posttest-progress.done {
+        background: rgba(82, 196, 26, 0.12);
+        border-color: rgba(82, 196, 26, 0.35);
+        color: #b7eb8f;
+      }
+      .tbh-posttest-progress.error {
+        background: rgba(255, 77, 79, 0.12);
+        border-color: rgba(255, 77, 79, 0.35);
+        color: #ffccc7;
+      }
+      .tbh-confirm-btn {
+        flex: 1;
+        padding: 8px 0;
+        border: none;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .tbh-confirm-btn.ok {
+        background: linear-gradient(135deg, #13c2c2, #36cfc9);
+        color: #fff;
+      }
+      .tbh-confirm-btn.cancel {
+        background: rgba(255,255,255,0.12);
+        color: #ddd;
+      }
       .tbh-body {
         max-height: 260px;
         overflow-y: auto;
@@ -267,12 +342,18 @@
           </div>
         </div>
         <button class="tbh-start-btn start" id="tbhStartBtn">启动自动播放</button>
+        <div class="tbh-confirm-row" id="tbhConfirmRow">
+          <button class="tbh-confirm-btn ok" id="tbhConfirmSubmitBtn">确认提交测试</button>
+          <button class="tbh-confirm-btn cancel" id="tbhCancelSubmitBtn">继续检查</button>
+        </div>
+        <div class="tbh-posttest-progress" id="tbhPostTestProgress">课后测试进度：待命</div>
       </div>
       <div class="tbh-body" id="tbhLogArea"></div>
     `;
     document.body.appendChild(panel);
 
     bindUIEvents();
+    renderPostTestProgress();
   }
 
   function bindUIEvents() {
@@ -280,6 +361,8 @@
     const speedDownBtn = document.getElementById('tbhSpeedDown');
     const speedUpBtn = document.getElementById('tbhSpeedUp');
     const minBtn = document.getElementById('tbhMinBtn');
+    const confirmSubmitBtn = document.getElementById('tbhConfirmSubmitBtn');
+    const cancelSubmitBtn = document.getElementById('tbhCancelSubmitBtn');
 
     startBtn.addEventListener('click', () => {
       isRunning ? stopAutoPlay() : startAutoPlay();
@@ -307,6 +390,8 @@
       panel.classList.toggle('minimized');
       minBtn.textContent = panel.classList.contains('minimized') ? '□' : '—';
     });
+    confirmSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('confirm'));
+    cancelSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('cancel'));
     makeDraggable(document.querySelector('.tbh-panel'), document.querySelector('.tbh-header'));
   }
 
@@ -352,6 +437,51 @@
       logArea.removeChild(logArea.firstChild);
     }
     logArea.scrollTop = logArea.scrollHeight;
+  }
+
+  function renderPostTestProgress() {
+    const el = document.getElementById('tbhPostTestProgress');
+    if (!el) return;
+    const parts = [];
+    const stageMap = {
+      idle: '待命',
+      detecting: '页面识别',
+      extracting: '提取题目',
+      planning: '生成答案方案',
+      applying: '填答中',
+      confirming: '等待确认',
+      submitting: '提交中',
+      done: '已完成',
+      error: '异常',
+    };
+    const stageText = stageMap[postTestProgress.stage] || postTestProgress.stage || '待命';
+    parts.push(`课后测试进度：${stageText}`);
+    if (postTestProgress.total > 0) {
+      parts.push(`${postTestProgress.resolved}/${postTestProgress.total} 题`);
+    }
+    if (postTestProgress.total > 0 && postTestProgress.stage !== 'idle') {
+      parts.push(`题库:${postTestProgress.fromBank} AI:${postTestProgress.fromAI} 规则:${postTestProgress.fromRule}`);
+    }
+    if (postTestProgress.avgConfidence > 0) {
+      parts.push(`置信度:${(postTestProgress.avgConfidence * 100).toFixed(1)}%`);
+    }
+    if (postTestProgress.summary) {
+      parts.push(postTestProgress.summary);
+    }
+    el.textContent = parts.join(' | ');
+    el.classList.remove('active', 'done', 'error');
+    if (postTestProgress.stage === 'done') el.classList.add('done');
+    else if (postTestProgress.stage === 'error') el.classList.add('error');
+    else if (postTestProgress.active) el.classList.add('active');
+  }
+
+  function updatePostTestProgress(patch = {}) {
+    postTestProgress = {
+      ...postTestProgress,
+      ...patch,
+    };
+    renderPostTestProgress();
+    syncHelperApi();
   }
 
   function escapeHtml(str) {
@@ -505,6 +635,541 @@
     return false;
   }
 
+  function getPostTestConfig() {
+    const cfg = getEmbedConfig();
+    return {
+      enabled: cfg.postTestEnabled !== false,
+      requireConfirm: cfg.postTestRequireConfirm !== false,
+      lowConfidenceThreshold: Number(cfg.postTestLowConfidenceThreshold) || 0.65,
+      autoSubmitThreshold: Number(cfg.postTestAutoSubmitThreshold) || 0.7,
+      model: cfg.postTestModel || 'glm-4-flash',
+      apiBaseUrl: cfg.postTestApiBaseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      apiKey: cfg.zhipuApiKey || '',
+      apiTimeoutMs: Number(cfg.postTestApiTimeoutMs) || 15000,
+    };
+  }
+
+  function normalizeText(input) {
+    return String(input || '')
+      .replace(/\s+/g, ' ')
+      .replace(/[，。；：！？]/g, (m) => ({ '，': ',', '。': '.', '；': ';', '：': ':', '！': '!', '？': '?' }[m] || m))
+      .trim()
+      .toLowerCase();
+  }
+
+  function hashText(text) {
+    let h = 0;
+    const str = String(text || '');
+    for (let i = 0; i < str.length; i++) {
+      h = ((h << 5) - h) + str.charCodeAt(i);
+      h |= 0;
+    }
+    return `q_${Math.abs(h)}`;
+  }
+
+  function getAccessibleDocuments() {
+    const docs = [{ doc: document, source: 'top' }];
+    const iframes = Array.from(document.querySelectorAll('iframe'));
+    iframes.forEach((iframe, idx) => {
+      try {
+        if (iframe.contentDocument) {
+          docs.push({ doc: iframe.contentDocument, source: `iframe#${idx + 1}` });
+        }
+      } catch (_) {}
+    });
+    return docs;
+  }
+
+  function isLikelyLoginDocument(doc) {
+    if (!doc) return false;
+    const hasLoginForm = !!doc.querySelector('#corpCode, #loginName, #swInput, .login-btn');
+    if (hasLoginForm) return true;
+    const text = (doc.body?.innerText || '').slice(0, 600).replace(/\s+/g, '');
+    return text.includes('密码登录在这里') || text.includes('扫码登录') || text.includes('手机确认登录');
+  }
+
+  function findPostTestContext() {
+    const docs = getAccessibleDocuments();
+    for (const { doc, source } of docs) {
+      const title = (doc.querySelector('.course-test-title, .course-test-head, .course-test-wrap .title, h1, h2, .ant-page-header-heading-title')?.textContent || '').trim();
+      const bodyText = (doc.body?.innerText || '').slice(0, 1000).replace(/\s+/g, ' ');
+      const hasQuestionList = !!doc.querySelector('.course-test-type-list-item, [class*="course-test-type-list-item"]');
+      const hasTestWrap = !!doc.querySelector('.course-test-wrap, .course-test-content, [class*="course-test"]');
+      const keywordHit = title.includes('课后测试') || title.toLowerCase().includes('post-test')
+        || /课后测试|post-test|post test|考试|测验/i.test(bodyText);
+      if ((hasQuestionList && hasTestWrap) || keywordHit) {
+        return { found: true, doc, source };
+      }
+    }
+    return { found: false, doc: null, source: '' };
+  }
+
+  function isPostTestPage() {
+    return findPostTestContext().found;
+  }
+
+  function findEvaluationContext() {
+    const docs = getAccessibleDocuments();
+    for (const { doc, source } of docs) {
+      if (doc.querySelector('.course-evaluate, .course-evaluate-title')) {
+        return { found: true, doc, source };
+      }
+    }
+    return { found: false, doc: null, source: '' };
+  }
+
+  function isLoginGatePage() {
+    const docs = getAccessibleDocuments();
+    return docs.some(({ doc }) => isLikelyLoginDocument(doc));
+  }
+
+  function detectQuestionType(item, options) {
+    const hasCheckbox = item.querySelector('.ant-checkbox-wrapper');
+    const hasRadio = item.querySelector('.ant-radio-wrapper');
+    if (hasCheckbox) return 'multiple';
+    if (hasRadio && options.length === 2) {
+      const text = options.map(o => o.text).join(' ');
+      if (/正确|错误|是|否|true|false/i.test(text)) return 'judge';
+    }
+    return hasRadio ? 'single' : 'single';
+  }
+
+  function extractOptionText(el) {
+    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function extractQuestionsForPostTest(doc = null) {
+    const targetDoc = doc || findPostTestContext().doc || document;
+    // 获取所有匹配选择器的元素
+    const allItems = Array.from(targetDoc.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"]'));
+    
+    // 只保留最外层的题目容器，过滤掉任何被嵌套在其他容器内部的“假题目”
+    const topLevelItems = allItems.filter(item => {
+      return !allItems.some(other => other !== item && other.contains(item));
+    });
+
+    console.log(`[TBH-PostTest] found ${allItems.length} total list items, filtered to ${topLevelItems.length} top-level questions`);
+
+    return topLevelItems.map((item, index) => {
+      const titleEl = item.querySelector('.course-test-type-list-item-title-content') || item.querySelector('.course-test-type-list-item-title');
+      const stem = (titleEl ? titleEl.textContent : item.textContent || '').replace(/\s+/g, ' ').trim();
+      const optionEls = Array.from(item.querySelectorAll('.ant-radio-wrapper, .ant-checkbox-wrapper'));
+      const options = optionEls.map((el, i) => {
+        const txt = extractOptionText(el);
+        const m = txt.match(/^([A-Z])[\.、\s]/);
+        const key = m ? m[1] : String.fromCharCode(65 + i);
+        return { key, text: txt };
+      });
+      return {
+        qid: hashText(`${index + 1}|${stem}|${options.map(o => `${o.key}:${o.text}`).join('|')}`),
+        index,
+        stem,
+        type: detectQuestionType(item, options),
+        options,
+      };
+    }).filter(q => q.options.length >= 2 && q.stem.length > 0); // 必须至少有2个选项才视为有效题目
+  }
+
+  function loadPostTestBank() {
+    try {
+      const raw = localStorage.getItem(CONFIG.POSTTEST_BANK_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function savePostTestBank(bank) {
+    try {
+      localStorage.setItem(CONFIG.POSTTEST_BANK_KEY, JSON.stringify(bank));
+    } catch (e) {
+      addLog(`题库保存失败：${e.message}`, 'warn');
+    }
+  }
+
+  function findBankAnswer(bank, question) {
+    if (!bank || !question) return null;
+    const normalizedStem = normalizeText(question.stem);
+    const exact = bank[question.qid];
+    if (exact) return exact;
+
+    const candidates = Object.values(bank);
+    for (const c of candidates) {
+      if (!c || !c.stemNorm) continue;
+      if (c.stemNorm === normalizedStem) return c;
+    }
+    return null;
+  }
+
+  function fallbackAnswer(question) {
+    if (question.type === 'multiple') {
+      const keys = question.options.slice(0, Math.min(2, question.options.length)).map(o => o.key);
+      return { answer: keys, confidence: 0.45, reason: 'fallback-multiple' };
+    }
+    return {
+      answer: (question.options[question.options.length - 1] || question.options[0])?.key || 'A',
+      confidence: 0.45,
+      reason: 'fallback-single',
+    };
+  }
+
+  function extractJsonArrayFromText(text) {
+    if (!text) return null;
+    const direct = text.trim();
+    try {
+      const parsed = JSON.parse(direct);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {}
+
+    const match = direct.match(/\[[\s\S]*\]/);
+    if (!match) return null;
+    try {
+      const parsed = JSON.parse(match[0]);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function callZhipuSolve(questions, cfg) {
+    if (!cfg.apiKey) {
+      return { ok: false, error: '未配置 ZHIPU_API_KEY' };
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), cfg.apiTimeoutMs);
+    try {
+      const payload = {
+        model: cfg.model,
+        temperature: 0.2,
+        messages: [
+          {
+            role: 'system',
+            content: '你是考试答题助手。只输出 JSON 数组，不要输出其他文字。字段: qid, answer, confidence, reason。single/judge answer 为单个字母，multiple answer 为字母数组。'
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({ questions }, null, 2)
+          }
+        ]
+      };
+
+      const resp = await fetch(cfg.apiBaseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.apiKey}`,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        return { ok: false, error: `HTTP ${resp.status} ${errText.slice(0, 200)}` };
+      }
+
+      const data = await resp.json();
+      const content = data?.choices?.[0]?.message?.content || '';
+      const items = extractJsonArrayFromText(content);
+      if (!items) {
+        return { ok: false, error: 'AI 返回内容不是有效 JSON 数组' };
+      }
+      return { ok: true, items };
+    } catch (e) {
+      return { ok: false, error: e.message || 'AI 请求失败' };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function normalizeAnswerForType(answer, type) {
+    if (type === 'multiple') {
+      if (Array.isArray(answer)) return [...new Set(answer.map(a => String(a).toUpperCase()))].sort();
+      if (typeof answer === 'string') {
+        const arr = answer.toUpperCase().split(/[^A-Z]+/).filter(Boolean);
+        return [...new Set(arr)].sort();
+      }
+      return [];
+    }
+    if (Array.isArray(answer)) return String(answer[0] || '').toUpperCase();
+    return String(answer || '').toUpperCase();
+  }
+
+  function findOptionElement(item, targetKey) {
+    const wrappers = Array.from(item.querySelectorAll('.ant-radio-wrapper, .ant-checkbox-wrapper'));
+    return wrappers.find((el, idx) => {
+      const text = extractOptionText(el);
+      const m = text.match(/^([A-Z])[\.、\s]/);
+      const key = m ? m[1] : String.fromCharCode(65 + idx);
+      return key === targetKey;
+    }) || null;
+  }
+
+  function clearQuestionSelection(item) {
+    const checked = item.querySelectorAll('.ant-radio-wrapper-checked, .ant-checkbox-wrapper-checked');
+    checked.forEach((el) => {
+      const input = el.querySelector('input');
+      if (input && input.checked) input.click();
+    });
+  }
+
+  async function applyPostTestAnswers(plan, doc = null) {
+    const targetDoc = doc || findPostTestContext().doc || document;
+    const allItems = Array.from(targetDoc.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"]'));
+    // 必须使用与提取时完全一致的过滤逻辑，否则 index 无法对应
+    const topLevelItems = allItems.filter(item => {
+      return !allItems.some(other => other !== item && other.contains(item));
+    });
+
+    console.log(`[TBH-PostTest] applying answers to ${topLevelItems.length} top-level questions`);
+
+    let applied = 0;
+    for (const p of plan.items) {
+      const item = topLevelItems[p.index];
+      if (!item) {
+        console.warn(`[TBH-PostTest] item not found at index ${p.index}`);
+        continue;
+      }
+      clearQuestionSelection(item);
+      const answerKeys = Array.isArray(p.answer) ? p.answer : [p.answer];
+      for (const key of answerKeys) {
+        const optionEl = findOptionElement(item, key);
+        if (optionEl) {
+          const input = optionEl.querySelector('input');
+          if (input && !input.checked) input.click();
+          else optionEl.click();
+          await sleep(150);
+        }
+      }
+      applied++;
+      await sleep(200);
+    }
+    return applied;
+  }
+
+  function showPostTestConfirmRow(summary) {
+    const row = document.getElementById('tbhConfirmRow');
+    const okBtn = document.getElementById('tbhConfirmSubmitBtn');
+    if (!row || !okBtn) return;
+    row.classList.add('show');
+    okBtn.textContent = summary ? `确认提交测试 (${summary})` : '确认提交测试';
+  }
+
+  function hidePostTestConfirmRow() {
+    const row = document.getElementById('tbhConfirmRow');
+    if (!row) return;
+    row.classList.remove('show');
+  }
+
+  function confirmPostTestSubmit(action) {
+    if (!postTestConfirmState.waiting || !postTestConfirmState.resolver) return;
+    const resolver = postTestConfirmState.resolver;
+    postTestConfirmState.waiting = false;
+    postTestConfirmState.resolver = null;
+    postTestConfirmState.planSummary = null;
+    hidePostTestConfirmRow();
+    syncHelperApi();
+    resolver(action);
+  }
+
+  function waitForPostTestConfirm(timeoutMs, summary) {
+    return new Promise((resolve) => {
+      postTestConfirmState.waiting = true;
+      postTestConfirmState.planSummary = summary || null;
+      postTestConfirmState.resolver = resolve;
+      showPostTestConfirmRow(summary);
+      syncHelperApi();
+      setTimeout(() => {
+        if (!postTestConfirmState.waiting) return;
+        confirmPostTestSubmit('timeout');
+      }, timeoutMs);
+    });
+  }
+
+  function clickPostTestSubmitButton() {
+    const targetDoc = findPostTestContext().doc || document;
+    const candidates = Array.from(targetDoc.querySelectorAll('button, .ant-btn'));
+    const btn = candidates.find((el) => {
+      const t = (el.textContent || '').replace(/\s+/g, '');
+      return ['提交', '提交测试', '交卷', 'Submit'].includes(t) || t.includes('提交');
+    });
+    if (!btn) return false;
+    btn.click();
+    return true;
+  }
+
+  function saveLearnedAnswersToBank(plan) {
+    const bank = loadPostTestBank();
+    plan.items.forEach((item) => {
+      bank[item.qid] = {
+        qid: item.qid,
+        stemNorm: normalizeText(item.stem),
+        answer: item.answer,
+        confidence: item.confidence,
+        source: item.source,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    savePostTestBank(bank);
+  }
+
+  async function handlePostTest() {
+    const cfg = getPostTestConfig();
+    if (!cfg.enabled || !isPostTestPage()) return false;
+    const context = findPostTestContext();
+    const postTestDoc = context.doc || document;
+
+    console.log('[TBH-PostTest] detected post-test page, flow starting');
+    addLog('🧠 检测到课后测试，开始自动答题流程...', 'success');
+    updatePostTestProgress({
+      active: true,
+      stage: 'detecting',
+      summary: `已识别课后测试页面（${context.source || 'top'}）`,
+      total: 0,
+      resolved: 0,
+      fromBank: 0,
+      fromAI: 0,
+      fromRule: 0,
+      avgConfidence: 0,
+    });
+    updatePostTestProgress({ stage: 'extracting', summary: '正在提取题目...' });
+    const questions = extractQuestionsForPostTest(postTestDoc);
+    if (questions.length === 0) {
+      console.log('[TBH-PostTest] no questions extracted');
+      addLog('⚠️ 未提取到测试题目', 'warn');
+      updatePostTestProgress({ stage: 'error', active: false, summary: '未提取到题目，请检查页面结构' });
+      return false;
+    }
+    console.log(`[TBH-PostTest] extracted questions: ${questions.length}`);
+    addLog(`已提取 ${questions.length} 道题`, 'info');
+    updatePostTestProgress({
+      stage: 'planning',
+      summary: '正在生成答题方案...',
+      total: questions.length,
+    });
+
+    const bank = loadPostTestBank();
+    const unresolved = [];
+    const planItems = [];
+    for (const q of questions) {
+      const hit = findBankAnswer(bank, q);
+      if (hit) {
+        planItems.push({
+          ...q,
+          answer: normalizeAnswerForType(hit.answer, q.type),
+          confidence: Math.min(0.99, Number(hit.confidence) || 0.9),
+          source: 'bank',
+          reason: '题库命中',
+        });
+      } else {
+        unresolved.push(q);
+      }
+    }
+    const fromBankCount = planItems.length;
+
+    if (unresolved.length > 0) {
+      const BATCH_SIZE = 10;
+      const totalBatches = Math.ceil(unresolved.length / BATCH_SIZE);
+      addLog(`题库命中 ${questions.length - unresolved.length}/${questions.length}，分 ${totalBatches} 批调用 AI 解答 ${unresolved.length} 题`, 'info');
+      
+      for (let i = 0; i < unresolved.length; i += BATCH_SIZE) {
+        const batch = unresolved.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+        updatePostTestProgress({ stage: 'solving', summary: `正在通过 AI 解答第 ${batchNum}/${totalBatches} 批题目...` });
+        
+        const aiRet = await callZhipuSolve(batch, cfg);
+        if (!aiRet.ok) {
+          console.log(`[TBH-PostTest] AI batch ${batchNum} solve failed: ${aiRet.error}`);
+          addLog(`⚠️ 第 ${batchNum} 批 AI 解答失败：${aiRet.error}，使用兜底答案`, 'warn');
+        }
+
+        batch.forEach((q) => {
+          const aiItem = aiRet.ok ? (aiRet.items || []).find((it) => it.qid === q.qid) : null;
+          if (aiItem) {
+            planItems.push({
+              ...q,
+              answer: normalizeAnswerForType(aiItem.answer, q.type),
+              confidence: Math.max(0, Math.min(1, Number(aiItem.confidence) || 0.6)),
+              source: 'ai',
+              reason: aiItem.reason || 'AI 推理',
+            });
+          } else {
+            const fb = fallbackAnswer(q);
+            planItems.push({
+              ...q,
+              answer: normalizeAnswerForType(fb.answer, q.type),
+              confidence: fb.confidence,
+              source: 'rule',
+              reason: fb.reason,
+            });
+          }
+        });
+      }
+    }
+
+    planItems.sort((a, b) => a.index - b.index);
+    const avgConfidence = planItems.reduce((s, i) => s + Number(i.confidence || 0), 0) / Math.max(1, planItems.length);
+    const lowConfidence = planItems.filter(i => Number(i.confidence || 0) < cfg.lowConfidenceThreshold);
+    const fromAICount = planItems.filter(i => i.source === 'ai').length;
+    const fromRuleCount = planItems.filter(i => i.source === 'rule').length;
+    updatePostTestProgress({
+      stage: 'applying',
+      summary: '正在自动填答...',
+      total: planItems.length,
+      resolved: planItems.length,
+      fromBank: fromBankCount,
+      fromAI: fromAICount,
+      fromRule: fromRuleCount,
+      avgConfidence,
+    });
+
+    const applied = await applyPostTestAnswers({ items: planItems }, postTestDoc);
+    console.log(`[TBH-PostTest] applied answers: ${applied}/${planItems.length}, avgConfidence=${avgConfidence}`);
+    addLog(`✅ 已自动填答 ${applied}/${planItems.length} 题 | 平均置信度 ${(avgConfidence * 100).toFixed(1)}%`, 'success');
+    updatePostTestProgress({ stage: 'applying', summary: `已填答 ${applied}/${planItems.length} 题` });
+    if (lowConfidence.length > 0) {
+      addLog(`⚠️ 低置信度题 ${lowConfidence.length} 道（阈值 ${cfg.lowConfidenceThreshold}）`, 'warn');
+    }
+
+    saveLearnedAnswersToBank({ items: planItems });
+
+    let shouldSubmit = !cfg.requireConfirm && avgConfidence >= cfg.autoSubmitThreshold && lowConfidence.length === 0;
+    if (!shouldSubmit) {
+      const summary = `${(avgConfidence * 100).toFixed(1)}%`;
+      addLog('⏸ 等待你点击「确认提交测试」按钮...', 'info');
+      updatePostTestProgress({ stage: 'confirming', summary: `等待确认提交（平均置信度 ${summary}）` });
+      const action = await waitForPostTestConfirm(CONFIG.POSTTEST_CONFIRM_TIMEOUT_MS, summary);
+      console.log(`[TBH-PostTest] confirm action: ${action}`);
+      if (action !== 'confirm') {
+        addLog(action === 'timeout' ? '确认超时，暂停自动提交' : '你已取消提交，保持当前答题结果', 'warn');
+        updatePostTestProgress({ stage: 'error', active: false, summary: action === 'timeout' ? '确认超时，未自动提交' : '你已取消提交' });
+        return false;
+      }
+      shouldSubmit = true;
+    }
+
+    if (!shouldSubmit) return false;
+    updatePostTestProgress({ stage: 'submitting', summary: '正在提交测试...' });
+    const submitted = clickPostTestSubmitButton();
+    if (submitted) {
+      console.log('[TBH-PostTest] submitted post-test');
+      addLog('📤 已提交课后测试', 'success');
+      playProgress.courseCompleted = true;
+      playProgress.lastActivityAt = new Date().toISOString();
+      syncHelperApi();
+      addLog('✅ 课后测试已完成，课程状态已标记为完成', 'success');
+      updatePostTestProgress({ stage: 'done', active: false, summary: '已提交并完成课后测试' });
+      return true;
+    }
+    console.log('[TBH-PostTest] submit button not found');
+    addLog('⚠️ 未找到课后测试提交按钮', 'warn');
+    updatePostTestProgress({ stage: 'error', active: false, summary: '未找到提交按钮，请手动检查页面' });
+    return false;
+  }
+
   async function startAutoPlay() {
     if (isRunning) return;
     isRunning = true;
@@ -514,9 +1179,13 @@
     syncHelperApi();
     addLog('🚀 自动播放已启动', 'success');
     try {
+      if (isPostTestPage()) {
+        await handlePostTest();
+        return;
+      }
       const comp = getCoursePlayComponent();
       if (!comp) {
-        addLog('未找到课程组件，切换到评估监听模式', 'warn');
+        addLog('未找到课程组件，切换到评估/测试监听模式', 'warn');
         await waitAndHandleEvaluationOnlyMode();
         return;
       }
@@ -546,13 +1215,40 @@
       } else {
         startResource = findFirstUnfinished(resources);
         if (!startResource) {
-          playProgress.courseCompleted = true;
-          playProgress.finishedResources = resources.length;
-          syncHelperApi();
-          addLog('🎉 所有课程已全部完成！', 'success');
-          stopAutoPlay();
+        // 如果资源全部完成，先看有没有课后测试或评估
+        if (isPostTestPage()) {
+          addLog('🧠 所有资源已完成，进入课后测试流程...', 'success');
+          await handlePostTest();
           return;
         }
+        if (isCourseEvaluatePage()) {
+          addLog('📝 所有资源已完成，进入课程评估流程...', 'success');
+          await handleCourseEvaluate();
+          return;
+        }
+        
+        // 尝试等待一会，看是否有测试/评估按钮延迟跳出
+        addLog('⏳ 所有资源已完成，等待测试/评估加载...', 'info');
+        await sleep(5000);
+        if (isPostTestPage()) {
+          addLog('🧠 检测到延迟加载的课后测试，开始答题...', 'success');
+          await handlePostTest();
+          return;
+        }
+        if (isCourseEvaluatePage()) {
+          addLog('📝 检测到延迟加载的课程评估，开始填写...', 'success');
+          await handleCourseEvaluate();
+          return;
+        }
+
+        // 确定都没有了，才标记课程完成
+        playProgress.courseCompleted = true;
+        playProgress.finishedResources = resources.length;
+        syncHelperApi();
+        addLog('🎉 课程内容及后续环节均已确认完成！', 'success');
+        stopAutoPlay();
+        return;
+      }
         addLog(`跳转到未完成内容: ${startResource.resourceName}`, 'warn');
         switchToSection(comp, startResource.chapterIdx, startResource.sectionIdx);
         await sleep(CONFIG.NEXT_WAIT_MS * 2);
@@ -566,9 +1262,41 @@
   }
 
   async function waitAndHandleEvaluationOnlyMode(maxWaitMs = 30 * 60 * 1000) {
-    addLog('⏳ 仅评估模式：等待课程评估页面出现...', 'info');
+    addLog('⏳ 仅评估/测试模式：等待页面出现...', 'info');
+    updatePostTestProgress({
+      active: true,
+      stage: 'detecting',
+      summary: '等待评估/课后测试页面出现',
+      total: 0,
+      resolved: 0,
+      fromBank: 0,
+      fromAI: 0,
+      fromRule: 0,
+      avgConfidence: 0,
+    });
     const startAt = Date.now();
+    let loginWarned = false;
     while (isRunning && (Date.now() - startAt) < maxWaitMs) {
+      if (isLoginGatePage()) {
+        if (!loginWarned) {
+          loginWarned = true;
+          addLog('⚠️ 当前页面是登录页，学习态可能失效。请先重新登录后再继续。', 'warn');
+          updatePostTestProgress({ stage: 'error', active: false, summary: '检测到登录页，请重新登录' });
+        }
+        await sleep(2000);
+        continue;
+      }
+      if (isPostTestPage()) {
+        addLog('🧠 检测到课后测试页面，开始自动答题...', 'success');
+        const postTestOk = await handlePostTest();
+        if (postTestOk) {
+          playProgress.courseCompleted = true;
+          playProgress.lastActivityAt = new Date().toISOString();
+          syncHelperApi();
+          addLog('✅ 仅测试模式执行完成', 'success');
+        }
+        break;
+      }
       if (isCourseEvaluatePage()) {
         addLog('📝 检测到课程评估页面，开始自动填写...', 'success');
         const ok = await handleCourseEvaluate();
@@ -582,19 +1310,35 @@
       }
       await sleep(2000);
     }
-    if (isRunning && !isCourseEvaluatePage()) {
-      addLog('⚠️ 等待评估页面超时，请手动检查页面状态', 'warn');
+    if (isRunning && !isCourseEvaluatePage() && !isPostTestPage()) {
+      addLog('⚠️ 等待评估/测试页面超时，请手动检查页面状态', 'warn');
+      updatePostTestProgress({ stage: 'error', active: false, summary: '等待评估/测试页面超时' });
     }
   }
 
   function stopAutoPlay() {
     isRunning = false;
+    if (postTestConfirmState.waiting) {
+      confirmPostTestSubmit('cancel');
+    }
+    updatePostTestProgress({ active: false, stage: 'idle', summary: '待命' });
     updateUI(false);
     addLog('⏹ 自动播放已停止', 'warn');
   }
 
   async function playLoop(comp, resources) {
     while (isRunning) {
+      if (isPostTestPage()) {
+        addLog('🧠 检测到课后测试页面，进入自动答题流程...', 'success');
+        const postTestOk = await handlePostTest();
+        if (postTestOk) {
+          playProgress.courseCompleted = true;
+          playProgress.lastActivityAt = new Date().toISOString();
+          syncHelperApi();
+          addLog('✅ 课后测试流程完成，当前课程已完成', 'success');
+        }
+        break;
+      }
       const freshComp = getCoursePlayComponent();
       if (!freshComp) { addLog('课程组件丢失，尝试恢复...', 'warn'); await sleep(3000); continue; }
       const freshData = getCourseData(freshComp);
@@ -611,7 +1355,9 @@
       playProgress.currentResourceName = current.resourceName;
       playProgress.currentChapterIdx = current.chapterIdx;
       playProgress.currentSectionIdx = current.sectionIdx;
-      playProgress.courseCompleted = (freshFinished === freshResources.length);
+      // 只有在资源数大于0且全部完成，且没有测试/评估的情况下才算课程完成
+      // 如果资源数为0，必须经过评估或测试流程才算完成
+      playProgress.courseCompleted = (freshResources.length > 0 && freshFinished === freshResources.length && !isPostTestPage() && !isCourseEvaluatePage());
       playProgress.lastActivityAt = new Date().toISOString();
       syncHelperApi();
 
@@ -646,7 +1392,29 @@
         }
         if (postEvalResult === false) { addLog('⚠️ 评估提交后未检测到后续按钮', 'warn'); await sleep(3000); }
       }
+      if (btnResult === 'posttest') {
+        addLog('🧠 检测到课后测试页面，开始自动答题...', 'success');
+        const postTestOk = await handlePostTest();
+        if (postTestOk) {
+          playProgress.courseCompleted = true;
+          playProgress.lastActivityAt = new Date().toISOString();
+          syncHelperApi();
+          addLog('✅ 课后测试流程完成，当前课程已完成', 'success');
+        }
+        break;
+      }
       if (btnResult === false) {
+        if (isPostTestPage()) {
+          addLog('🧠 检测到课后测试页面（延迟出现），开始自动答题...', 'success');
+          const postTestOk = await handlePostTest();
+          if (postTestOk) {
+            playProgress.courseCompleted = true;
+            playProgress.lastActivityAt = new Date().toISOString();
+            syncHelperApi();
+            addLog('✅ 课后测试流程完成，当前课程已完成', 'success');
+          }
+          break;
+        }
         if (isCourseEvaluatePage()) {
           addLog('📝 检测到课程评估页面（延迟出现），开始自动填写...', 'success');
           await handleCourseEvaluate();
@@ -663,10 +1431,17 @@
       if (!isRunning) break;
       const nextUnfinished = findNextUnfinished(freshResources, curIdx);
       if (!nextUnfinished) {
+        // 先检查是否有延迟出现的测试/评估
+        addLog('⏳ 正在检查是否有后续测试或评估...', 'info');
+        await sleep(5000);
+        if (isPostTestPage() || isCourseEvaluatePage()) {
+          continue; // 让循环继续，去处理测试/评估
+        }
+
         playProgress.courseCompleted = true;
         playProgress.finishedResources = freshResources.length;
         syncHelperApi();
-        addLog('🎉 所有课程已全部完成！', 'success');
+        addLog('🎉 所有课程内容及后续环节均已完成！', 'success');
         break;
       }
       let clicked = clickNextButton();
@@ -684,6 +1459,7 @@
       const done = (val) => { if (resolved) return; resolved = true; resolve(val); };
       const checkTimer = setInterval(() => {
         if (!isRunning) { clearInterval(checkTimer); done(false); return; }
+        if (isPostTestPage()) { clearInterval(checkTimer); addLog('🧠 检测到课后测试页面', 'success'); done('posttest'); return; }
         if (isCourseEvaluatePage()) { clearInterval(checkTimer); addLog('📝 检测到课程评估页面', 'success'); done('evaluate'); return; }
         const replayBtn = document.querySelector('.replay-btn');
         if (replayBtn && replayBtn.offsetHeight > 0) { clearInterval(checkTimer); addLog('🔄 检测到「重看」按钮（最后一节已完成）', 'success'); done('rewatch'); return; }
@@ -733,10 +1509,12 @@
   }
 
   function isCourseEvaluatePage() {
-    return !!(document.querySelector('.course-evaluate') || document.querySelector('.course-evaluate-title'));
+    return findEvaluationContext().found;
   }
 
   async function handleCourseEvaluate() {
+    const evalContext = findEvaluationContext();
+    const evalDoc = evalContext.doc || document;
     addLog('📝 检测到课程评估页面，开始自动填写...', 'success');
     await sleep(1000);
     // 优先复用独立评估模块（固定题目、固定答案）
@@ -756,10 +1534,10 @@
     } catch (e) {
       addLog(`⚠️ EvalAuto 调用异常，转为兜底提交流程：${e.message}`, 'warn');
     }
-    const zeroStar = document.querySelector('.ant-rate .ant-rate-star-zero');
+    const zeroStar = evalDoc.querySelector('.ant-rate .ant-rate-star-zero');
     if (zeroStar) { zeroStar.click(); addLog('⭐ 已完成课程评分（5星）', 'success'); await sleep(500); }
     else { addLog('⭐ 评分星星已全部选中，跳过', 'info'); }
-    const questions = document.querySelectorAll('.course-test-type-list-item');
+    const questions = evalDoc.querySelectorAll('.course-test-type-list-item');
     let questionCount = 0;
     questions.forEach((q) => {
       const radioWrappers = q.querySelectorAll('.ant-radio-wrapper');
@@ -771,7 +1549,7 @@
     });
     addLog(`✅ 已完成 ${questionCount} 道单选题（全部选择最高分）`, 'success');
     await sleep(500);
-    const inputDiv = document.querySelector('.course-test-type-list-item-options-input');
+    const inputDiv = evalDoc.querySelector('.course-test-type-list-item-options-input');
     if (inputDiv) {
       const textarea = inputDiv.querySelector('textarea');
       if (textarea) {
@@ -782,9 +1560,9 @@
         await sleep(500);
       }
     }
-    const submitBtn = document.querySelector('.course-evaluate button.ant-btn-primary:not(.course-header-btn)');
+    const submitBtn = evalDoc.querySelector('.course-evaluate button.ant-btn-primary:not(.course-header-btn)');
     if (submitBtn) {
-      const buttons = document.querySelectorAll('.course-evaluate button.ant-btn-primary');
+      const buttons = evalDoc.querySelectorAll('.course-evaluate button.ant-btn-primary');
       let targetBtn = null;
       buttons.forEach(btn => {
         const text = btn.textContent.trim();
@@ -805,6 +1583,7 @@
   function isCoursePlayPage() {
     const url = window.location.href;
     if (/\/courseLearning\/play/i.test(url) || /\/courseSetting\/.*play/i.test(url)) return true;
+    if (isPostTestPage()) return true;
     if (document.querySelector('.chapter-container')) return true;
     if (document.querySelector('.J_prismPlayer')) return true;
     if (document.querySelector('video')) {
@@ -828,11 +1607,11 @@
       maybeAutoStart();
       return;
     }
-    if (!document.querySelector('.chapter-container')) return;
+    if (!document.querySelector('.chapter-container') && !isPostTestPage()) return;
     uiInjected = true;
     injectUI();
     applyEmbeddedDefaults();
-    addLog('时光易学视频助手 v2.2.0 已就绪', 'success');
+    addLog('时光易学视频助手 v2.3.0 已就绪', 'success');
     addLog(`当前页面: ${window.location.pathname}`, 'info');
     if (getEmbedConfig().autoStart) {
       addLog('已检测到 Skill 内嵌自动播放请求', 'info');

@@ -24,6 +24,15 @@ function normalizeConfig(config = {}) {
     evalStars: Number(config.evalStars) || 5,     // 星级评分
     evalChoice: (config.evalChoice || 'd').toLowerCase(), // 选择题选项
     evalEssay: config.evalEssay || '很不错，高效',        // 论述题答案
+    // 课后测试自动答题配置
+    postTestEnabled: config.postTestEnabled !== false,
+    postTestRequireConfirm: config.postTestRequireConfirm !== false,
+    postTestLowConfidenceThreshold: Number(config.postTestLowConfidenceThreshold) || 0.65,
+    postTestAutoSubmitThreshold: Number(config.postTestAutoSubmitThreshold) || 0.7,
+    postTestModel: config.postTestModel || 'glm-4-flash',
+    postTestApiBaseUrl: config.postTestApiBaseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    postTestApiTimeoutMs: Number(config.postTestApiTimeoutMs) || 15000,
+    zhipuApiKey: config.zhipuApiKey || '',
   };
 }
 

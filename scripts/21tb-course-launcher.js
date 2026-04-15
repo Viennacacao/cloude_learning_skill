@@ -24,6 +24,22 @@ const fs = require('fs');
 const path = require('path');
 const { prepareEmbeddedPlayer, waitForEmbeddedPlayer } = require('./21tb-player-embed');
 
+function loadProjectEnv() {
+  const envFile = path.join(__dirname, '..', '.env');
+  if (!fs.existsSync(envFile)) return;
+  const lines = fs.readFileSync(envFile, 'utf-8').split(/\r?\n/);
+  for (const line of lines) {
+    const raw = line.trim();
+    if (!raw || raw.startsWith('#')) continue;
+    const idx = raw.indexOf('=');
+    if (idx <= 0) continue;
+    const key = raw.slice(0, idx).trim();
+    const val = raw.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
+loadProjectEnv();
+
 // ========================
 // 配置
 // ========================
@@ -261,6 +277,14 @@ async function openCourseWithEmbeddedPlayer(page, target) {
     autoStartDelayMs: 1800,
     defaultSpeed: 16,
     source: 'course-launcher',
+    postTestEnabled: true,
+    postTestRequireConfirm: String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true',
+    postTestLowConfidenceThreshold: 0.65,
+    postTestAutoSubmitThreshold: 0.7,
+    postTestModel: process.env.ZHIPU_MODEL || 'glm-4-flash',
+    postTestApiBaseUrl: process.env.ZHIPU_API_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    postTestApiTimeoutMs: Number(process.env.POSTTEST_AI_TIMEOUT_MS) || 15000,
+    zhipuApiKey: process.env.ZHIPU_API_KEY || '',
   });
 
   await page.goto(target.url, {

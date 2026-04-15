@@ -8,6 +8,8 @@
     "auto": "node 21tb-login-crawler.js --auto"
   },
   "dependencies": {
+    "axios": "^1.15.0",
+    "dotenv": "^17.4.2",
     "puppeteer": "^24.0.0"
   }
 }

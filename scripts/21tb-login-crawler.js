@@ -24,6 +24,22 @@ const path = require('path');
 const { prepareEmbeddedPlayer, waitForEmbeddedPlayer, getEmbeddedPlayerState, isEvaluationPage, runEvaluationAuto, pollAndHandleEvaluation } = require('./21tb-player-embed');
 const { createRunReporter } = require('./21tb-status-reporter');
 
+function loadProjectEnv() {
+  const envFile = path.join(__dirname, '..', '.env');
+  if (!fs.existsSync(envFile)) return;
+  const lines = fs.readFileSync(envFile, 'utf-8').split(/\r?\n/);
+  for (const line of lines) {
+    const raw = line.trim();
+    if (!raw || raw.startsWith('#')) continue;
+    const idx = raw.indexOf('=');
+    if (idx <= 0) continue;
+    const key = raw.slice(0, idx).trim();
+    const val = raw.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
+loadProjectEnv();
+
 // ========================
 // 配置
 // ========================
@@ -499,10 +515,10 @@ async function crawlCourseList(page) {
         // 检查是否已完成
         const isFinished = fullText.includes('Finish') || fullText.includes('Currently completed') || fullText.includes('已完成') || !!finishTag;
 
-        // 判定脚本是否可自动完成 (视频播放 + 课程评估)
-        // 如果进度已经是“课后测试”或“Post-test”，则脚本无法继续
+        // 判定脚本是否可自动完成 (视频播放 + 课程评估 + AI 课后测试)
+        // 现在脚本已集成 AI 答题，大部分课后测试也可自动处理
         const isTestStage = progress.includes('课后测试') || progress.includes('Post-test') || progress.includes('考试');
-        const isCompletable = !isFinished && !isTestStage;
+        const isCompletable = !isFinished; // 即使是测试阶段也可尝试自动完成
 
         // 提取学分和学时
         let hours = '', credits = '';
@@ -1141,6 +1157,14 @@ async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle) {
     autoStartDelayMs: 1800,
     defaultSpeed: 16,
     source: 'login-crawler',
+    postTestEnabled: true,
+    postTestRequireConfirm: String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true',
+    postTestLowConfidenceThreshold: 0.65,
+    postTestAutoSubmitThreshold: 0.7,
+    postTestModel: process.env.ZHIPU_MODEL || 'glm-4-flash',
+    postTestApiBaseUrl: process.env.ZHIPU_API_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    postTestApiTimeoutMs: Number(process.env.POSTTEST_AI_TIMEOUT_MS) || 15000,
+    zhipuApiKey: process.env.ZHIPU_API_KEY || '',
   });
 
   await page.goto(courseUrl, {
@@ -1327,6 +1351,58 @@ async function watchAndAutoAdvance(page, unfinishedCourses, options = {}) {
   if (onAllDone) onAllDone(courseQueue.length);
 }
 
+function startSingleCourseNotifier(page, course, options = {}) {
+  const { pollIntervalMs = 15000 } = options;
+  let lastProgressText = '';
+  let completed = false;
+
+  const timer = setInterval(async () => {
+    if (completed) return;
+    const state = await getEmbeddedPlayerState(page).catch(() => null);
+    if (!state || !state.progress) return;
+
+    const p = state.progress;
+    const percent = p.totalResources > 0
+      ? Math.round((p.finishedResources / p.totalResources) * 100)
+      : 0;
+    const progressText = `${p.finishedResources}/${p.totalResources}:${p.currentResourceName || ''}`;
+
+    if (progressText !== lastProgressText) {
+      lastProgressText = progressText;
+      log(
+        `📈 [进度] ${course.title}：${p.finishedResources}/${p.totalResources} (${percent}%) | 当前：${p.currentResourceName || '加载中...'}`,
+        'info'
+      );
+      if (reporter) {
+        reporter.emit('course_progress', {
+          courseTitle: course.title,
+          courseId: course.id,
+          totalResources: p.totalResources,
+          finishedResources: p.finishedResources,
+          percent,
+          currentResourceName: p.currentResourceName || '',
+        });
+      }
+    }
+
+    if (p.courseCompleted || (p.totalResources > 0 && p.finishedResources >= p.totalResources)) {
+      completed = true;
+      clearInterval(timer);
+      log(`✅ 课程已完成：${course.title}`, 'success');
+      log('📣 课程完成提醒：该课程已达成完成状态', 'success');
+      if (reporter) {
+        reporter.emit('course_complete', {
+          courseTitle: course.title,
+          courseId: course.id,
+          status: 'completed',
+        });
+      }
+    }
+  }, pollIntervalMs);
+
+  return timer;
+}
+
 // ========================
 // 主流程
 // ========================
@@ -1491,7 +1567,7 @@ async function main() {
         }
 
         if (!course.isCompletable && !course.isFinished) {
-          log(`⚠️ 课程 "${course.title}" 包含课后测试环节，脚本仅能完成视频播放和评估，后续请手动操作。`, 'warn');
+          log(`ℹ️ 课程 "${course.title}" 包含课后测试环节，助手将尝试通过 AI 自动答题。`, 'info');
         }
 
         log(`正在打开指定课程: ${course.title}`, 'info');
@@ -1527,6 +1603,10 @@ async function main() {
       }
 
       reporter.updateState({ phase: 'playing' });
+      if (matchedCourses.length === 1) {
+        log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
+        startSingleCourseNotifier(page, matchedCourses[0], { pollIntervalMs: 15000 });
+      }
       log('浏览器将保持打开状态，按 Ctrl+C 退出', 'info');
       await new Promise(() => {});
       return;
@@ -1577,6 +1657,10 @@ async function main() {
 
       // 非 auto-advance：保持浏览器打开
       reporter.updateState({ phase: 'playing' });
+      if (!opts.autoAdvance) {
+        log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
+        startSingleCourseNotifier(page, selectedCourse, { pollIntervalMs: 15000 });
+      }
       log('浏览器将保持打开状态，按 Ctrl+C 退出', 'info');
       await new Promise(() => {});
       return;
