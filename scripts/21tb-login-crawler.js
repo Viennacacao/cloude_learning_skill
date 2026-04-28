@@ -21,7 +21,7 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { prepareEmbeddedPlayer, waitForEmbeddedPlayer, getEmbeddedPlayerState, isEvaluationPage, runEvaluationAuto, pollAndHandleEvaluation } = require('./21tb-player-embed');
+const { prepareEmbeddedPlayer, injectEmbeddedPlayerIntoCurrentPage, waitForEmbeddedPlayer, getEmbeddedPlayerState, isEvaluationPage, runEvaluationAuto, pollAndHandleEvaluation } = require('./21tb-player-embed');
 const { createRunReporter } = require('./21tb-status-reporter');
 
 function loadProjectEnv() {
@@ -72,6 +72,7 @@ function parseArgs() {
     jsonMode: false,
     progressLogsDir: '',
     autoEval: true,       // 默认开启评估自动完成
+    agent: false,         // 面向 Agent 的对话式模式（单页串行、可退出）
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -83,6 +84,7 @@ function parseArgs() {
       case '--auto': case '-a': opts.auto = true; break;
       case '--auto-advance': opts.autoAdvance = true; break;
       case '--no-auto-eval': opts.autoEval = false; break;
+      case '--agent': opts.agent = true; break;
       case '--headless': opts.headless = true; break;
       case '--json': opts.jsonMode = true; break;
       case '--progress-logs': opts.progressLogsDir = args[++i] || ''; break;
@@ -101,6 +103,7 @@ function parseArgs() {
   -a, --auto               一键全自动模式（登录后自动进入第一个未完成课程）
   --auto-advance           完成当前课程后自动推进下一门未完成课程
   --no-auto-eval           禁用评估自动完成（默认开启）
+  --agent                  面向 Agent 的对话式模式（默认单页串行；完成后自动退出；建议配合 --json）
   --headless               无头模式（不显示浏览器窗口）
   --json                   结构化 JSON 输出（每行一个 JSON 事件，适合 Agent/程序解析）
   --progress-logs [dir]    结构化进度日志目录（默认 cloud-video-learning/runtime-logs）
@@ -111,6 +114,7 @@ function parseArgs() {
   node 21tb-login-crawler.js -e your_id -u your_user -p your_password --auto
   node 21tb-login-crawler.js -e your_id -u your_user -p your_password -c "课程名"
   node 21tb-login-crawler.js -e your_id -u your_user -p your_password --auto --auto-advance --json
+  node 21tb-login-crawler.js --agent --auto --auto-advance --json
         `);
         process.exit(0);
     }
@@ -1151,12 +1155,20 @@ function log(msg, level = 'info', options = {}) {
   }
 }
 
-async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle) {
-  await prepareEmbeddedPlayer(page, {
+async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle, openOptions = {}) {
+  // 进入课程页后再注入（满足“只在课程页面注入”的约束）
+  await page.goto(courseUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: CONFIG.TIMEOUT,
+  });
+
+  // 修复：--no-auto-eval 需要真正生效（通过 autoEval 传入注入配置）
+  await injectEmbeddedPlayerIntoCurrentPage(page, {
     autoStart: true,
     autoStartDelayMs: 1800,
     defaultSpeed: 16,
     source: 'login-crawler',
+    autoEval: openOptions.autoEval !== false,
     postTestEnabled: true,
     postTestRequireConfirm: String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true',
     postTestLowConfidenceThreshold: 0.65,
@@ -1167,17 +1179,237 @@ async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle) {
     zhipuApiKey: process.env.ZHIPU_API_KEY || '',
   });
 
-  await page.goto(courseUrl, {
-    waitUntil: 'networkidle2',
-    timeout: CONFIG.TIMEOUT,
-  });
-
   const helperState = await waitForEmbeddedPlayer(page).catch(() => null);
   if (helperState) {
     log(`内置播放助手已注入：${courseTitle}（${helperState.currentSpeed}x，自动启动=${helperState.autoStart ? '是' : '否'}）`, 'success');
   } else {
     log(`课程页已打开，但未能及时确认内置播放助手状态：${courseTitle}`, 'warn');
   }
+}
+
+/**
+ * 等待单门课程完成（以 helper 的 courseCompleted 为准）
+ * - 同时输出/上报 course_progress
+ * - 兜底处理评估页（不把评估当作完成）
+ * - 捕捉 post-test 状态（confirm_required / posttest_complete）
+ */
+async function waitForCourseCompletion(page, course, options = {}) {
+  const {
+    pollIntervalMs = 15000,
+    maxPolls = 7200, // 最多轮询 30 小时（15s * 7200）
+    onProgress,
+    autoEval = true,
+  } = options;
+
+  let lastProgressText = '';
+  let emittedPostTestConfirm = false;
+  let emittedPostTestComplete = false;
+  let postTestConfirmRequestWritten = false;
+
+  const requireConfirm =
+    String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true';
+  const confirmTimeoutMs =
+    Number(process.env.POSTTEST_CONFIRM_TIMEOUT_MS) || 30 * 60 * 1000; // 默认 30 分钟
+  const confirmPollMs = 1000;
+
+  const getRuntimeLogsDir = () => {
+    try {
+      const st = reporter?.getState?.();
+      const statePath = st?.files?.statePath;
+      if (statePath) return path.dirname(statePath);
+    } catch {}
+    return path.join(__dirname, '..', 'runtime-logs');
+  };
+
+  const getConfirmFiles = () => {
+    const dir = getRuntimeLogsDir();
+    const sid = reporter?.sessionId || 'unknown-session';
+    return {
+      dir,
+      requestPath: path.join(dir, `${sid}.posttest_confirm_required.json`),
+      decisionPath: path.join(dir, `${sid}.posttest_decision.json`),
+    };
+  };
+
+  const waitForDecisionAndApply = async (summary) => {
+    if (!requireConfirm) return;
+    const { requestPath, decisionPath } = getConfirmFiles();
+
+    // 写入确认请求文件（供 Agent/外部程序读取）
+    if (!postTestConfirmRequestWritten) {
+      postTestConfirmRequestWritten = true;
+      try {
+        fs.writeFileSync(
+          requestPath,
+          JSON.stringify(
+            {
+              type: 'posttest_confirm_required',
+              timestamp: new Date().toISOString(),
+              sessionId: reporter?.sessionId,
+              courseTitle: course.title,
+              courseId: course.id,
+              summary: summary || '',
+              decisionPath,
+            },
+            null,
+            2
+          ),
+          'utf-8'
+        );
+      } catch (e) {
+        log(`写入 posttest_confirm_required 文件失败：${e.message}`, 'warn');
+      }
+    }
+
+    if (reporter) {
+      reporter.updateState({
+        phase: 'awaiting_posttest_confirm',
+        postTestConfirm: {
+          waiting: true,
+          requestPath,
+          decisionPath,
+        },
+      });
+    }
+
+    log('⏸️ 检测到课后测试需要人工确认提交，等待外部决策文件...', 'warn');
+
+    const start = Date.now();
+    while (Date.now() - start < confirmTimeoutMs) {
+      try {
+        if (fs.existsSync(decisionPath)) {
+          const raw = fs.readFileSync(decisionPath, 'utf-8');
+          const decision = JSON.parse(raw || '{}');
+          const action = String(decision.action || '').toLowerCase();
+
+          if (action !== 'confirm' && action !== 'cancel') {
+            log(`决策文件 action 无效（需 confirm/cancel）：${decisionPath}`, 'warn');
+          } else {
+            // 在页面内执行确认/取消
+            await page
+              .evaluate((act) => {
+                if (!window.__TBH_HELPER__) return false;
+                if (act === 'confirm') window.__TBH_HELPER__.approvePostTestSubmit();
+                if (act === 'cancel') window.__TBH_HELPER__.rejectPostTestSubmit();
+                return true;
+              }, action)
+              .catch(() => false);
+
+            if (reporter) {
+              reporter.emit('posttest_confirm_resolved', {
+                courseTitle: course.title,
+                courseId: course.id,
+                action,
+              });
+              reporter.updateState({
+                phase: 'playing',
+                postTestConfirm: { waiting: false, action },
+              });
+            }
+
+            log(`✅ 已处理课后测试确认：${action}`, 'success');
+          }
+
+          // 不删除决策文件：保留审计痕迹；后续可由外部清理
+          return;
+        }
+      } catch (e) {
+        log(`读取决策文件失败：${e.message}`, 'warn');
+      }
+
+      await sleep(confirmPollMs);
+    }
+
+    log('⚠️ 等待课后测试确认超时，将继续轮询课程状态（可稍后补充决策文件）', 'warn');
+  };
+
+  for (let i = 0; i < maxPolls; i++) {
+    const state = await getEmbeddedPlayerState(page).catch(() => null);
+
+    // 评估页兜底（不作为完成条件）
+    if (autoEval) {
+      const evalDetected = await isEvaluationPage(page).catch(() => false);
+      if (evalDetected) {
+        try {
+          const evalResult = await runEvaluationAuto(page);
+          if (evalResult.success) {
+            log(`✅ ${course.title}：评估已自动完成并提交！`, 'success');
+            if (reporter) reporter.emit('eval_complete', { courseTitle: course.title, courseId: course.id });
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (state && state.postTestConfirm && state.postTestConfirm.waiting && !emittedPostTestConfirm) {
+      emittedPostTestConfirm = true;
+      if (reporter) {
+        reporter.emit('posttest_confirm_required', {
+          courseTitle: course.title,
+          courseId: course.id,
+          summary: state.postTestConfirm.summary || '',
+        });
+      }
+      // 真正的“可对话闭环”：等待外部写入决策文件后再继续
+      await waitForDecisionAndApply(state.postTestConfirm.summary || '');
+    }
+
+    if (state && state.postTestProgress && state.postTestProgress.stage === 'done' && !emittedPostTestComplete) {
+      emittedPostTestComplete = true;
+      if (reporter) {
+        reporter.emit('posttest_complete', {
+          courseTitle: course.title,
+          courseId: course.id,
+          avgConfidence: state.postTestProgress.avgConfidence,
+          total: state.postTestProgress.total,
+          resolved: state.postTestProgress.resolved,
+        });
+      }
+    }
+
+    if (state && state.progress) {
+      const p = state.progress;
+      const percent = p.totalResources > 0 ? Math.round((p.finishedResources / p.totalResources) * 100) : 0;
+      const progressText = `${p.finishedResources}/${p.totalResources}:${p.currentResourceName || ''}`;
+
+      if (progressText !== lastProgressText) {
+        lastProgressText = progressText;
+        log(`📈 [进度] ${course.title}：${p.finishedResources}/${p.totalResources} (${percent}%) | 当前：${p.currentResourceName || '加载中...'}`, 'info');
+        if (reporter) {
+          reporter.emit('course_progress', {
+            courseTitle: course.title,
+            courseId: course.id,
+            totalResources: p.totalResources,
+            finishedResources: p.finishedResources,
+            percent,
+            currentResourceName: p.currentResourceName || '',
+          });
+        }
+      }
+
+      if (onProgress) onProgress(course, p);
+
+      if (reporter) {
+        reporter.updateState({
+          currentCourse: { title: course.title, id: course.id },
+          currentCourseProgress: {
+            totalResources: p.totalResources,
+            finishedResources: p.finishedResources,
+            percent,
+            currentResourceName: p.currentResourceName,
+            courseCompleted: !!p.courseCompleted,
+          },
+        });
+      }
+
+      if (p.courseCompleted) return true;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  return false;
 }
 
 /**
@@ -1191,6 +1423,7 @@ async function watchAndAutoAdvance(page, unfinishedCourses, options = {}) {
     onCourseComplete,
     onAllDone,
     onProgress,
+    openOptions = {},
   } = options;
 
   let courseQueue = [...unfinishedCourses];
@@ -1222,95 +1455,18 @@ async function watchAndAutoAdvance(page, unfinishedCourses, options = {}) {
     log(`▶ [${currentIndex + 1}/${courseQueue.length}] 正在学习：${course.title}`, 'success');
     if (onCourseStart) onCourseStart(course, currentIndex);
 
-    // 等一会儿让注入的脚本初始化
+    // 每门课都在同一个 page 上打开，确保“同一时间只开一门课”
+    const courseUrl = CONFIG.COURSE_PLAY_URL_TEMPLATE + course.id;
+    await openCourseWithEmbeddedPlayer(page, courseUrl, course.title, openOptions);
+    report('course_opened', { courseTitle: course.title, courseId: course.id, status: 'playing' });
+
+    // 等待该课程真正完成（以 courseCompleted 为准）
     await sleep(checkDelayMs);
-
-    let courseDone = false;
-    let pollCount = 0;
-    const maxPolls = 3600; // 最多轮询 30 小时
-
-    while (!courseDone && pollCount < maxPolls) {
-      await sleep(pollIntervalMs);
-      pollCount++;
-
-      const state = await getEmbeddedPlayerState(page).catch(() => null);
-
-      // 检测是否进入评估页面（视频播放完毕后自动跳转）
-      if (!courseDone) {
-        const evalDetected = await isEvaluationPage(page).catch(() => false);
-        if (evalDetected) {
-          log(`📋 [${currentIndex + 1}/${courseQueue.length}] 检测到课程评估页面，自动填写并提交...`, 'info');
-          
-          try {
-            const evalResult = await runEvaluationAuto(page);
-            if (evalResult.success) {
-              log(`✅ [${currentIndex + 1}/${courseQueue.length}] ${course.title}：评估已自动完成并提交！`, 'success');
-              report('eval_complete', { courseTitle: course.title, courseId: course.id });
-            } else {
-              log(`⚠️ [${currentIndex + 1}/${courseQueue.length}] ${course.title}：评估执行异常 - ${evalResult.error || '未知错误'}`, 'warn');
-            }
-          } catch (evalErr) {
-            log(`❌ [${currentIndex + 1}/${courseQueue.length}] ${course.title}：评估模块出错 - ${evalErr.message}`, 'error');
-          }
-
-          // 评估完成后标记课程为已完成
-          courseDone = true;
-        }
-      }
-
-      if (state && state.progress) {
-        const p = state.progress;
-        const progressPct = p.totalResources > 0
-          ? Math.round((p.finishedResources / p.totalResources) * 100)
-          : 0;
-
-        log(
-          `[${currentIndex + 1}/${courseQueue.length}] ${course.title}：${p.finishedResources}/${p.totalResources} 资源已完成 (${progressPct}%) | 当前：${p.currentResourceName || '加载中...'}`,
-          'info'
-        );
-
-        if (onProgress) {
-          onProgress(course, p);
-        }
-
-        if (reporter) {
-          reporter.updateState({
-            currentCourse: {
-              title: course.title,
-              id: course.id,
-              index: currentIndex + 1,
-              total: courseQueue.length,
-            },
-            currentCourseProgress: {
-              totalResources: p.totalResources,
-              finishedResources: p.finishedResources,
-              percent: progressPct,
-              currentResourceName: p.currentResourceName,
-              courseCompleted: !!p.courseCompleted,
-            },
-          });
-        }
-
-        if (p.courseCompleted || p.finishedResources >= p.totalResources) {
-          courseDone = true;
-        }
-      }
-
-      // 备用检测：检查页面是否刷新到非课程页或出现了课程完成标识
-      if (!courseDone) {
-        const pageDone = await page.evaluate(() => {
-          // 检查是否有课程完成标识
-          const finishEl = document.querySelector('.finish-tag, .nc-finish, .course-complete');
-          if (finishEl) return true;
-          // 检查是否不在课程播放页了
-          return false;
-        }).catch(() => false);
-
-        if (pageDone) {
-          courseDone = true;
-        }
-      }
-    }
+    const courseDone = await waitForCourseCompletion(page, course, {
+      pollIntervalMs,
+      onProgress,
+      autoEval: openOptions.autoEval !== false,
+    });
 
     finishedSet.add(course.id);
     report('course_complete', {
@@ -1330,15 +1486,9 @@ async function watchAndAutoAdvance(page, unfinishedCourses, options = {}) {
       break;
     }
 
-    // 等待并打开下一门课程
-    log(`等待 5 秒后自动推进到下一门课程...`, 'info');
-    await sleep(5000);
-
-    const nextCourse = courseQueue[currentIndex];
-    const nextUrl = CONFIG.COURSE_PLAY_URL_TEMPLATE + nextCourse.id;
-
-    log(`正在打开下一门课程：${nextCourse.title}`, 'info');
-    await openCourseWithEmbeddedPlayer(page, nextUrl, nextCourse.title);
+    if (!courseDone) {
+      log(`⚠️ [${currentIndex}/${courseQueue.length}] ${course.title}：等待超时或未能确认完成状态，将继续推进（可在日志中排查）`, 'warn');
+    }
   }
 
   report('all_courses_complete', {
@@ -1385,7 +1535,7 @@ function startSingleCourseNotifier(page, course, options = {}) {
       }
     }
 
-    if (p.courseCompleted || (p.totalResources > 0 && p.finishedResources >= p.totalResources)) {
+    if (p.courseCompleted) {
       completed = true;
       clearInterval(timer);
       log(`✅ 课程已完成：${course.title}`, 'success');
@@ -1408,9 +1558,16 @@ function startSingleCourseNotifier(page, course, options = {}) {
 // ========================
 async function main() {
   const opts = parseArgs();
-  let enterprise = opts.enterprise;
-  let username = opts.user;
-  let password = opts.pass;
+  if (opts.agent) {
+    // Agent 模式：默认输出结构化事件，且尽量避免交互阻塞
+    opts.jsonMode = true;
+    opts.headless = true;
+  }
+  // 优先使用命令行参数；未提供时回退到 .env / 环境变量
+  // 这样可以避免在命令行里暴露账号密码（更安全，也更适合自动化）。
+  let enterprise = opts.enterprise || process.env.TB_ENTERPRISE_ID || '';
+  let username = opts.user || process.env.TB_USER || '';
+  let password = opts.pass || process.env.TB_PASS || '';
 
   // 初始化结构化上报器
   const logsDir = opts.progressLogsDir || path.join(__dirname, '..', 'runtime-logs');
@@ -1431,15 +1588,24 @@ async function main() {
     // JSON 模式下跳过 banner，直接输出结构化数据
   }
 
-  // 如果没有提供凭据，交互式询问
-  if (!enterprise) {
-    enterprise = await askQuestion('请输入企业ID: ');
-  }
-  if (!username) {
-    username = await askQuestion('请输入用户名: ');
-  }
-  if (!password) {
-    password = await askQuestion('请输入密码: ', true);
+  // 如果没有提供凭据：
+  // - Agent 模式下：直接报错退出（避免 stdin 阻塞）
+  // - 非 Agent 模式：继续交互式询问
+  if (!enterprise || !username || !password) {
+    if (opts.agent) {
+      const missing = [
+        !enterprise ? 'TB_ENTERPRISE_ID/--enterprise' : null,
+        !username ? 'TB_USER/--user' : null,
+        !password ? 'TB_PASS/--pass' : null,
+      ].filter(Boolean);
+      log(`缺少登录凭据：${missing.join(', ')}`, 'error');
+      reporter.emit('error', { message: `missing_credentials: ${missing.join(', ')}` }, 'error');
+      reporter.close('missing_credentials');
+      return;
+    }
+    if (!enterprise) enterprise = await askQuestion('请输入企业ID: ');
+    if (!username) username = await askQuestion('请输入用户名: ');
+    if (!password) password = await askQuestion('请输入密码: ', true);
   }
 
   log('正在启动浏览器...', 'info', { eventType: 'browser_launching' });
@@ -1555,34 +1721,33 @@ async function main() {
         return;
       }
 
-      for (let index = 0; index < matchedCourses.length; index++) {
-        const course = matchedCourses[index];
-        const courseUrl = CONFIG.COURSE_PLAY_URL_TEMPLATE + course.id;
-        const targetPage = index === 0 ? page : await browser.newPage();
-
-        if (index > 0) {
-          await targetPage.setUserAgent(
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      // Agent/自动推进：单页串行学习（同一时间只开一门课）
+      if (opts.agent || opts.autoAdvance || matchedCourses.length > 1) {
+        let queue = [...matchedCourses];
+        if (opts.autoAdvance && matchedCourses.length === 1 && completableCourses.length > 1) {
+          const remainingCompletable = completableCourses.filter(
+            c => !matchedCourses.some(m => m.id === c.id)
           );
+          if (remainingCompletable.length > 0) {
+            queue = matchedCourses.concat(remainingCompletable);
+          }
         }
-
-        if (!course.isCompletable && !course.isFinished) {
-          log(`ℹ️ 课程 "${course.title}" 包含课后测试环节，助手将尝试通过 AI 自动答题。`, 'info');
-        }
-
-        log(`正在打开指定课程: ${course.title}`, 'info');
-        log('将使用 Skill 内置播放助手自动接管课程播放（不依赖油猴）', 'success');
-        await openCourseWithEmbeddedPlayer(targetPage, courseUrl, course.title);
-        reporter.emit('course_opened', {
-          courseTitle: course.title,
-          courseId: course.id,
-          status: 'playing',
+        reporter.updateState({ phase: 'auto_advancing' });
+        await watchAndAutoAdvance(page, queue, {
+          pollIntervalMs: 30000,
+          openOptions: { autoEval: opts.autoEval },
         });
-
-        if (index < matchedCourses.length - 1) {
-          await sleep(2000);
-        }
+        reporter.close('all_done', { completedCount: queue.length });
+        return;
       }
+
+      // 非 Agent：只打开一门指定课程并保持浏览器打开
+      const course = matchedCourses[0];
+      const courseUrl = CONFIG.COURSE_PLAY_URL_TEMPLATE + course.id;
+      log(`正在打开指定课程: ${course.title}`, 'info');
+      log('将使用 Skill 内置播放助手自动接管课程播放（不依赖油猴）', 'success');
+      await openCourseWithEmbeddedPlayer(page, courseUrl, course.title, { autoEval: opts.autoEval });
+      reporter.emit('course_opened', { courseTitle: course.title, courseId: course.id, status: 'playing' });
 
       if (opts.autoAdvance && matchedCourses.length === 1 && completableCourses.length > 1) {
         // 如果只指定了一门课且开了自动推进，在完成这门课后继续推进其余可自动完成的课程
@@ -1593,6 +1758,7 @@ async function main() {
           log(`完成当前课程后，将自动推进剩余 ${remainingCompletable.length} 门可自动完成的课程`, 'success');
           reporter.updateState({ phase: 'auto_advancing' });
           await watchAndAutoAdvance(page, matchedCourses.concat(remainingCompletable), {
+            openOptions: { autoEval: opts.autoEval },
             onProgress: (course, progress) => {
               // 进度更新已由 watchAndAutoAdvance 内部处理
             },
@@ -1603,10 +1769,8 @@ async function main() {
       }
 
       reporter.updateState({ phase: 'playing' });
-      if (matchedCourses.length === 1) {
-        log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
-        startSingleCourseNotifier(page, matchedCourses[0], { pollIntervalMs: 15000 });
-      }
+      log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
+      startSingleCourseNotifier(page, matchedCourses[0], { pollIntervalMs: 15000 });
       log('浏览器将保持打开状态，按 Ctrl+C 退出', 'info');
       await new Promise(() => {});
       return;
@@ -1628,10 +1792,23 @@ async function main() {
         return;
       }
 
+      // Agent 或开启 auto-advance：串行推进（同一时间只开一门课）
+      if (opts.agent || opts.autoAdvance) {
+        const queue = completableCourses;
+        reporter.updateState({ phase: 'auto_advancing' });
+        await watchAndAutoAdvance(page, queue, {
+          pollIntervalMs: 30000,
+          openOptions: { autoEval: opts.autoEval },
+        });
+        reporter.close('all_done', { completedCount: queue.length });
+        return;
+      }
+
+      // 非 auto-advance：只打开第一门课程并保持浏览器打开
       const courseUrl = CONFIG.COURSE_PLAY_URL_TEMPLATE + selectedCourse.id;
       log(`正在打开课程: ${selectedCourse.title}`, 'info');
       log('将使用 Skill 内置播放助手自动接管课程播放（不依赖油猴）', 'success');
-      await openCourseWithEmbeddedPlayer(page, courseUrl, selectedCourse.title);
+      await openCourseWithEmbeddedPlayer(page, courseUrl, selectedCourse.title, { autoEval: opts.autoEval });
       reporter.emit('course_opened', {
         courseTitle: selectedCourse.title,
         courseId: selectedCourse.id,
@@ -1640,27 +1817,9 @@ async function main() {
         status: 'playing',
       });
 
-      if (opts.autoAdvance && completableCourses.length > 1) {
-        log(`自动推进模式已开启，完成当前课程后将自动学习剩余 ${completableCourses.length - 1} 门可自动完成的课程`, 'success');
-        reporter.updateState({ phase: 'auto_advancing' });
-
-        await watchAndAutoAdvance(page, completableCourses, {
-          pollIntervalMs: 30000,
-          onProgress: (course, progress) => {
-            // 状态已由 watchAndAutoAdvance 内部上报
-          },
-        });
-
-        reporter.close('all_done', { completedCount: completableCourses.length });
-        return;
-      }
-
-      // 非 auto-advance：保持浏览器打开
       reporter.updateState({ phase: 'playing' });
-      if (!opts.autoAdvance) {
-        log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
-        startSingleCourseNotifier(page, selectedCourse, { pollIntervalMs: 15000 });
-      }
+      log('已启用单课程完成通知：每次进度变化和完成状态都会输出到终端', 'info');
+      startSingleCourseNotifier(page, selectedCourse, { pollIntervalMs: 15000 });
       log('浏览器将保持打开状态，按 Ctrl+C 退出', 'info');
       await new Promise(() => {});
       return;
@@ -1717,7 +1876,7 @@ async function main() {
         await newPage.setUserAgent(
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         );
-        await openCourseWithEmbeddedPlayer(newPage, courseUrl, course?.title || courseId);
+        await openCourseWithEmbeddedPlayer(newPage, courseUrl, course?.title || courseId, { autoEval: opts.autoEval });
 
         if (selectedIds.indexOf(courseId) < selectedIds.length - 1) {
           await sleep(2000);

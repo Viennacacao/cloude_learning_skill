@@ -1,3 +1,8 @@
+---
+name: 云端视频学习
+description: 自动化完成 21tb「时光易学」平台的在线课程学习：一键登录、获取课表、自动播放；视频结束后自动提交课程评估，并可选用智谱 AI 自动完成课后测试。
+---
+
 # 云端视频学习 Skill
 
 自动化完成 21tb 时光易学平台的在线课程学习。用户只需提供企业ID、账号、密码，即可一键登录、获取课表、启动课程播放，**视频播完后自动填写并提交课程评估，课后测试通过 AI 自动答题**。
@@ -66,13 +71,127 @@ POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认提交，默认 fa
 
 ## 工作流程
 
-### 模式一：一键全自动（推荐）
+### 默认（推荐）：Agent 内置浏览器 Browser-only 串行学习
+
+> 目标：**不依赖 Puppeteer、不下载/安装额外浏览器**，直接使用 Agent 软件自带浏览器完成：
+> 登录 → 进入课程 → **进入课程页后注入** → 自动播放/评估/课后测试 → 对话确认提交 → 完成。
+>
+> 约束：**同一时间只打开一门课**（串行）。
+>
+> 默认行为：**只完成用户指定的课程并停下回报**。如用户在对话中输入“下一门/继续”，再自动推进到下一门未完成课程（仍然单课串行）。
+
+#### 对话命令（面向 Agent）
+
+- `学习 <课程名>`：打开并完成该课程，完成后停下回报
+- `下一门` / `继续`：在课程中心中选择“下一门未完成课程”并开始学习
+- `停止`：停止自动化（保持当前页面不再操作）
+
+#### Step 0：准备可被 https 页面加载的脚本地址（避免 Mixed Content）
+
+由于课程页是 `https://`，浏览器会阻止从 `http://127.0.0.1` 加载脚本（Mixed Content）。
+因此 **Browser-only 默认使用 https 资源地址**（推荐放在 GitHub Raw / 你自己的 https 静态站点）。
+
+推荐（GitHub Raw 示例，固定 tag/commit）：
+- Runner：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js`
+- 播放助手：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js`
+- 评估模块：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js`
+
+> 稳定性建议：生产使用时建议把 `main` 替换为 **tag/commit hash**，避免脚本更新导致行为变化。
+
+> 本仓库内的 `scripts/21tb-asset-server.js` 可作为“本地调试/非 https 页面/自建 https 代理”时的资源服务，但不作为默认方案。
+
+#### Step 1：用 Agent 内置浏览器登录
+
+1. 打开登录页：`https://v4.21tb.com/login/login.init.do`
+2. 切换到密码登录（若默认是二维码）：点击 “Password login here”
+3. 填写：Company ID / Username / Password
+4. 若出现 “Continue/Cancel” 弹窗：点 Continue
+
+> 也支持自动登录：Runner 可在登录页读取 `__TBH_RUNNER_CONFIG__` 里的 `enterpriseId/username/password` 自动填表并提交。  
+> 推荐由 Agent 从本地 `.env` 读取后再注入（若缺失会提示用户输入）。
+
+#### Step 2：进入课程中心并打开指定课程
+
+课程中心（My Courses）：  
+`https://v4.21tb.com/els/html/index.parser.do?id=NEW_COURSE_CENTER&current_app_id=8a80810f5ab29060015ad1906d0b3811#!/els/html/courseCenter/courseCenter.loadStudyTask.do`
+
+打开课程后进入播放页（URL 通常包含）：`/courseSetting/courseLearning/play?...courseId=...`
+
+#### Step 3：进入课程页后注入 helper/eval（Browser-only）
+
+在课程中心页（My Courses）执行以下逻辑（通过 Agent 的浏览器 evaluate 注入）。Runner 会自动打开课程播放页，并在播放页内注入 helper/eval：
+
+```js
+(() => {
+  window.__TBH_RUNNER_CONFIG__ = {
+    // 登录（可选；用于自动登录）
+    enterpriseId: '<TB_ENTERPRISE_ID>',
+    username: '<TB_USER>',
+    password: '<TB_PASS>',
+
+    // helper 行为
+    autoStart: true,
+    autoStartDelayMs: 1800,
+    defaultSpeed: 16,
+    autoEval: true,
+
+    // 课后测试
+    postTestEnabled: true,
+    postTestRequireConfirm: true, // 若希望自动提交则设 false
+    postTestModel: 'glm-4-flash',
+    postTestApiBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    postTestApiTimeoutMs: 60000,
+    zhipuApiKey: '<ZHIPU_API_KEY>',
+
+    // 资源（需 https）
+    helperUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js',
+    evalAutoUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js',
+  };
+
+  const s = document.createElement('script');
+  s.src = 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js';
+  s.onload = () => window.__TBH_RUNNER__?.startCourseByName?.('阳明心学——实践的哲学');
+  (document.head || document.documentElement).appendChild(s);
+})();
+```
+
+> 重要：上述 tag/commit 必须已推送到 GitHub 远端；若你尚未 push/tag，请先 push/tag，或临时把 URL 改为 `main`。
+
+> 安全提示：`zhipuApiKey` 建议由 Agent 从本地 `.env` 读取后再注入，避免写死在提示词/文档里。
+
+#### Step 4：轮询状态并对话式确认提交
+
+反复读取：
+- `window.__TBH_HELPER__.getState().progress.courseCompleted`（true 表示课程真正完成）
+- `window.__TBH_HELPER__.getState().postTestConfirm.waiting`
+
+当出现 `postTestConfirm.waiting === true`：
+- Agent 在对话中询问用户“是否提交课后测试？”
+- 用户确认：执行 `window.__TBH_HELPER__.approvePostTestSubmit()`
+- 用户取消：执行 `window.__TBH_HELPER__.rejectPostTestSubmit()`
+
+当出现 `courseCompleted === true`：
+- Agent 回报“指定课程已完成”
+- 等待用户下一条对话指令（默认不自动跳转下一门；除非用户说“下一门/继续”）
+
+### 后备方案（可选）：Puppeteer 脚本一键全自动
+
+> 仅当你不使用 Agent 内置浏览器，或需要纯命令行无人值守运行时使用。  
+> 注意：此方案通常需要可用的 Chrome/Chromium（可能触发下载/安装）。
+
+#### 一键全自动
 
 ```bash
 node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码> --auto
 ```
 
 流程：登录 → 获取课表 → 选择第一个未完成课程 → 注入播放助手自动播放 → 视频播完自动填评估提交 → 自动检测并完成课后测试
+
+#### Agent 对话式（Puppeteer 后备）：单页串行 + 自动退出
+
+```bash
+node scripts/21tb-login-crawler.js --agent --auto --auto-advance --json
+```
 
 ### 模式一补充：按课程名直达
 
@@ -198,6 +317,8 @@ node scripts/21tb-course-launcher.js --interactive
 | `course_progress` | 播放进度更新 |
 | `eval_complete` | 课程评估已完成提交 |
 | `posttest_complete` | 课后测试已完成提交 |
+| `posttest_confirm_required` | 课后测试需要人工确认提交（当开启确认模式且置信度不足时） |
+| `posttest_confirm_resolved` | 已收到人工决策并执行（confirm/cancel） |
 | `course_complete` | 某门课程全部完成 |
 | `all_courses_complete` | 全部课程完成 |
 | `error` | 错误 |
@@ -247,6 +368,6 @@ node scripts/21tb-login-crawler.js -e {企业ID} -u {用户名} -p {密码} --au
 3. **课后测试默认尝试 AI 答题**：即使未配置 API Key，脚本也会使用规则兜底（选 D）尝试完成
 4. **浏览器保持打开**：脚本执行后浏览器保持打开，不要手动关闭
 5. **登录态有效期**：session 过期需重新运行脚本
-6. **并发建议**：同时打开不超过 3 个课程标签页
+6. **Agent 模式默认单课串行**：同一时间只学习一门课程（更稳定，也更符合对话式工作流）
 7. **倍速设置**：内置播放助手默认 16x，可在控制面板调整
 8. **.env 安全**：所有敏感信息（账号密码、API Key）必须放在 `.env` 文件中，永不提交到 GitHub

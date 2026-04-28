@@ -22,7 +22,7 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { prepareEmbeddedPlayer, waitForEmbeddedPlayer } = require('./21tb-player-embed');
+const { prepareEmbeddedPlayer, injectEmbeddedPlayerIntoCurrentPage, waitForEmbeddedPlayer } = require('./21tb-player-embed');
 
 function loadProjectEnv() {
   const envFile = path.join(__dirname, '..', '.env');
@@ -272,11 +272,18 @@ function extractCourseIdFromUrl(url) {
 }
 
 async function openCourseWithEmbeddedPlayer(page, target) {
-  await prepareEmbeddedPlayer(page, {
+  await page.goto(target.url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000,
+  });
+
+  // 进入课程页后再注入（满足“只在课程页面注入”的约束）
+  await injectEmbeddedPlayerIntoCurrentPage(page, {
     autoStart: true,
     autoStartDelayMs: 1800,
     defaultSpeed: 16,
     source: 'course-launcher',
+    autoEval: true,
     postTestEnabled: true,
     postTestRequireConfirm: String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true',
     postTestLowConfidenceThreshold: 0.65,
@@ -285,11 +292,6 @@ async function openCourseWithEmbeddedPlayer(page, target) {
     postTestApiBaseUrl: process.env.ZHIPU_API_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     postTestApiTimeoutMs: Number(process.env.POSTTEST_AI_TIMEOUT_MS) || 15000,
     zhipuApiKey: process.env.ZHIPU_API_KEY || '',
-  });
-
-  await page.goto(target.url, {
-    waitUntil: 'networkidle2',
-    timeout: 30000,
   });
 
   const helperState = await waitForEmbeddedPlayer(page).catch(() => null);

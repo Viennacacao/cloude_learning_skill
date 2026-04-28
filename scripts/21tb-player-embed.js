@@ -19,6 +19,8 @@ function normalizeConfig(config = {}) {
     autoStartDelayMs: Number(config.autoStartDelayMs) || 1800,
     defaultSpeed: Number(config.defaultSpeed) || 16,
     source: config.source || 'skill-embedded',
+    // 注入策略：默认仅在课程相关页面注入，避免污染登录/课表页
+    injectAnyPage: config.injectAnyPage === true,
     // 评估自动完成配置
     autoEval: config.autoEval !== false,          // 是否自动完成评估（默认开启）
     evalStars: Number(config.evalStars) || 5,     // 星级评分
@@ -36,6 +38,12 @@ function normalizeConfig(config = {}) {
   };
 }
 
+function isCourseRelatedUrl(url) {
+  // 课程播放/评估/测试一般都在 courseSetting 下；这里用较宽松的 URL gate
+  // 以满足“进入课程页面后再注入”的约束（避免登录页/课表页注入）。
+  return /\/courseSetting\//i.test(url) || /courseLearning\/play/i.test(url);
+}
+
 async function prepareEmbeddedPlayer(page, config = {}) {
   const helperSource = loadEmbeddedHelperSource();
   const evalAutoSource = loadEvalAutoSource();
@@ -46,6 +54,16 @@ async function prepareEmbeddedPlayer(page, config = {}) {
       window.__TBH_EMBED_CONFIG__ = embedConfig;
 
       const injectHelperScript = () => {
+        try {
+          if (!embedConfig.injectAnyPage) {
+            const href = String(window.location && window.location.href ? window.location.href : '');
+            if (!/\/courseSetting\//i.test(href) && !/courseLearning\/play/i.test(href)) {
+              return;
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
         if (window.__TBH_EMBED_SCRIPT_INJECTED__) return;
         window.__TBH_EMBED_SCRIPT_INJECTED__ = true;
 
@@ -79,6 +97,49 @@ async function prepareEmbeddedPlayer(page, config = {}) {
   return embedConfig;
 }
 
+/**
+ * 在“当前已加载的页面”里注入播放助手（用于：进入课程页后再注入）
+ * @param {import('puppeteer').Page} page
+ * @param {Object} config
+ */
+async function injectEmbeddedPlayerIntoCurrentPage(page, config = {}) {
+  const helperSource = loadEmbeddedHelperSource();
+  const evalAutoSource = loadEvalAutoSource();
+  const embedConfig = normalizeConfig(config);
+
+  await page.evaluate(({ helperSource, evalAutoSource, embedConfig }) => {
+    window.__TBH_EMBED_CONFIG__ = embedConfig;
+
+    if (window.__TBH_EMBED_SCRIPT_INJECTED__) return;
+
+    const href = String(window.location && window.location.href ? window.location.href : '');
+    if (!embedConfig.injectAnyPage && !/\/courseSetting\//i.test(href) && !/courseLearning\/play/i.test(href)) {
+      // 不是课程相关页面：不注入
+      return;
+    }
+
+    window.__TBH_EMBED_SCRIPT_INJECTED__ = true;
+
+    const script = document.createElement('script');
+    script.type = 'text/javascript';
+    script.setAttribute('data-tbh-embedded', '1');
+    script.textContent = helperSource;
+    (document.documentElement || document.head || document.body).appendChild(script);
+    script.remove();
+
+    if (embedConfig.autoEval) {
+      const evalScript = document.createElement('script');
+      evalScript.type = 'text/javascript';
+      evalScript.setAttribute('data-tbh-eval-auto', '1');
+      evalScript.textContent = evalAutoSource;
+      (document.documentElement || document.head || document.body).appendChild(evalScript);
+      evalScript.remove();
+    }
+  }, { helperSource, evalAutoSource, embedConfig });
+
+  return embedConfig;
+}
+
 async function waitForEmbeddedPlayer(page, timeout = 20000) {
   await page.waitForFunction(() => {
     return !!(window.__TBH_HELPER__ && typeof window.__TBH_HELPER__.getState === 'function');
@@ -101,6 +162,7 @@ async function getEmbeddedPlayerState(page) {
 
 module.exports = {
   prepareEmbeddedPlayer,
+  injectEmbeddedPlayerIntoCurrentPage,
   waitForEmbeddedPlayer,
   getEmbeddedPlayerState,
 };
