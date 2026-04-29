@@ -74,9 +74,70 @@
     return window.__TBH_EMBED_CONFIG__ || {};
   }
 
+  // ========================
+  // 跨窗口可视化与回传（用于 Trae “独立播放窗口”无法打开 DevTools 的场景）
+  // ========================
+  const CHANNEL_NAME = 'TBH_CHANNEL_V1';
+  let bc = null;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      bc = new BroadcastChannel(CHANNEL_NAME);
+    }
+  } catch (_) {
+    bc = null;
+  }
+
+  function safePostMessage(payload) {
+    // 1) BroadcastChannel（同源多窗口最稳）
+    try {
+      if (bc) bc.postMessage(payload);
+    } catch (_) {}
+    // 2) opener.postMessage（如果是 window.open 打开的，且仍可访问）
+    try {
+      if (window.opener && typeof window.opener.postMessage === 'function') {
+        window.opener.postMessage(payload, '*');
+      }
+    } catch (_) {}
+  }
+
+  function ensureInjectedBadge() {
+    try {
+      if (document.getElementById('tbhInjectedBadge')) return;
+      const badge = document.createElement('div');
+      badge.id = 'tbhInjectedBadge';
+      badge.style.cssText = [
+        'position:fixed',
+        'top:10px',
+        'left:10px',
+        'z-index:2147483647',
+        'background:rgba(0,0,0,0.78)',
+        'color:#fff',
+        'font-size:12px',
+        'line-height:1',
+        'padding:8px 10px',
+        'border-radius:8px',
+        'box-shadow:0 6px 18px rgba(0,0,0,.25)',
+        'user-select:text',
+        'cursor:default',
+        'max-width:70vw',
+        'white-space:pre-line',
+      ].join(';');
+      badge.textContent = 'TBH 已注入\n状态：待初始化';
+      (document.body || document.documentElement).appendChild(badge);
+    } catch (_) {}
+  }
+
+  function updateInjectedBadge(textLines) {
+    try {
+      const el = document.getElementById('tbhInjectedBadge');
+      if (!el) return;
+      el.textContent = textLines;
+    } catch (_) {}
+  }
+
   function syncHelperApi() {
     window.__TBH_HELPER__ = {
-      version: '2.3.0',
+      version: '2.3.1',
       start: startAutoPlay,
       stop: stopAutoPlay,
       approvePostTestSubmit: () => confirmPostTestSubmit('confirm'),
@@ -99,6 +160,30 @@
     };
   }
 
+  function broadcastState(reason) {
+    try {
+      if (!window.__TBH_HELPER__ || !window.__TBH_HELPER__.getState) return;
+      const st = window.__TBH_HELPER__.getState();
+      safePostMessage({
+        type: 'TBH_STATE',
+        reason: reason || 'tick',
+        at: new Date().toISOString(),
+        url: location.href,
+        state: st,
+      });
+      // 同时更新徽标，便于肉眼确认“已注入且在跑”
+      const p = st.progress || {};
+      const lines = [
+        'TBH 已注入',
+        `状态：${st.isRunning ? '运行中' : '待命'}`,
+        `进度：${Number(p.finishedResources || 0)}/${Number(p.totalResources || 0)}`,
+        p.currentResourceName ? `当前：${p.currentResourceName}` : '',
+        st.postTestConfirm && st.postTestConfirm.waiting ? '课后测试：等待确认' : '',
+      ].filter(Boolean).join('\n');
+      updateInjectedBadge(lines);
+    } catch (_) {}
+  }
+
   function applyEmbeddedDefaults() {
     const cfg = getEmbedConfig();
     const nextSpeed = Number(cfg.defaultSpeed);
@@ -110,6 +195,17 @@
       speedVal.textContent = `${currentSpeed}x`;
     }
     syncHelperApi();
+    broadcastState('applyEmbeddedDefaults');
+  }
+
+  function startBroadcastLoop() {
+    // 每 2 秒回传一次状态（足够实时，又不会过度消耗）
+    try {
+      if (window.__TBH_BROADCAST_TIMER__) return;
+      window.__TBH_BROADCAST_TIMER__ = setInterval(() => {
+        broadcastState('loop');
+      }, 2000);
+    } catch (_) {}
   }
 
   function maybeAutoStart() {
@@ -117,6 +213,7 @@
     if (!cfg.autoStart || autoStartTriggered || isRunning || !uiInjected) return;
     autoStartTriggered = true;
     syncHelperApi();
+    broadcastState('autoStartTriggered');
     const delay = Number(cfg.autoStartDelayMs) > 0 ? Number(cfg.autoStartDelayMs) : 1800;
     addLog(`检测到 Skill 内嵌模式，${Math.round(delay / 100) / 10}s 后自动启动`, 'info');
     window.setTimeout(() => {
@@ -125,6 +222,13 @@
       startAutoPlay();
     }, delay);
   }
+
+  // 立刻注入一个“已注入徽标”（即使课程页面资源尚未完全渲染，也能让用户看到脚本确实进来了）
+  ensureInjectedBadge();
+  // 尽早暴露 API 并开始回传
+  syncHelperApi();
+  applyEmbeddedDefaults();
+  startBroadcastLoop();
 
   // ========================
   // UI 注入：控制面板 + 样式 + 拖拽

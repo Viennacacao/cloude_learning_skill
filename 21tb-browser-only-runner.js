@@ -27,6 +27,27 @@
     return;
   }
 
+  // ========================
+  // 跨窗口监听（用于 Trae “独立播放窗口”无法打开 DevTools 的场景）
+  // ========================
+  var CHANNEL_NAME = 'TBH_CHANNEL_V1';
+  var lastBroadcast = null;
+  var bc = null;
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      bc = new BroadcastChannel(CHANNEL_NAME);
+      bc.onmessage = function (ev) {
+        try {
+          var data = ev && ev.data;
+          if (!data || data.type !== 'TBH_STATE') return;
+          lastBroadcast = data;
+        } catch (_) {}
+      };
+    }
+  } catch (_) {
+    bc = null;
+  }
+
   var DEFAULTS = {
     // 注入行为
     autoStart: true,
@@ -52,7 +73,8 @@
     closeCourseTabOnComplete: true,
     pollMs: 10000,
     injectTimeoutMs: 45000,
-    openTimeoutMs: 60000,
+    // 某些环境下新窗口加载较慢，默认放宽
+    openTimeoutMs: 120000,
     debug: false,
   };
 
@@ -167,6 +189,15 @@
     var submit = selectOne(['.login-btn', 'button[type=submit]', 'button[name=submit]']);
     if (submit) submit.click();
 
+    // 等待跳转离开 login 页（最多 30 秒）
+    var navStart = Date.now();
+    while (Date.now() - navStart < 30000) {
+      try {
+        if (!/\/login\/login\.init\.do/i.test(location.href)) break;
+      } catch {}
+      await sleep(500);
+    }
+
     // 若出现 “Continue/Cancel” 弹窗，点 Continue
     var start = Date.now();
     while (Date.now() - start < 15000) {
@@ -181,6 +212,27 @@
 
     emit('phase', { phase: 'login_submitted' });
     return true;
+  }
+
+  async function ensureCourseCenterReady() {
+    var target = 'https://v4.21tb.com/els/html/index.parser.do?id=NEW_COURSE_CENTER&current_app_id=8a80810f5ab29060015ad1906d0b3811#!/els/html/courseCenter/courseCenter.loadStudyTask.do';
+
+    for (var i = 0; i < 120; i++) { // 最多等 60s
+      if (isCourseCenterPage()) return true;
+
+      if (isLoginPage()) {
+        await maybeAutoLogin();
+        // 登录后不管跳到哪里，都强制去课程中心（避免停在 OS 首页）
+        try { location.href = target; } catch {}
+      } else {
+        // 已登录但不在课程中心：跳转到课程中心
+        try { location.href = target; } catch {}
+      }
+
+      await sleep(500);
+    }
+
+    throw new Error('进入课程中心超时（请检查是否登录成功/是否出现验证码或弹窗拦截）');
   }
 
   function ensureAbsolute(url) {
@@ -391,12 +443,12 @@
     var start = Date.now();
     while (Date.now() - start < state.config.openTimeoutMs) {
       try {
-        if (w && !w.closed && w.location && String(w.location.href || '').indexOf('/courseSetting/') >= 0) {
-          // 等 document 可用 + body 有内容（避免空白页就注入）
+        if (!w) break;
+        if (!w.closed) {
+          // 某些内置浏览器对新开 tab 的 URL/快照能力较弱，这里不强依赖 href 判断，
+          // 只要能拿到 document 且 readyState 非 loading，就认为页面已可注入。
           if (w.document && w.document.readyState && w.document.readyState !== 'loading') {
-            if (w.document.body && w.document.body.childNodes && w.document.body.childNodes.length >= 0) {
-              return w;
-            }
+            return w;
           }
         }
       } catch (e2) {
@@ -406,7 +458,7 @@
     }
 
     state.phase = 'error';
-    state.error = '打开课程页超时';
+    state.error = w ? '打开课程页超时（可能新窗口未完全加载/被弹窗拦截）' : 'window.open 失败（可能被浏览器策略拦截）';
     emit('error', { error: state.error });
     throw new Error(state.error);
   }
@@ -440,6 +492,9 @@
     } catch (e) {
       // ignore
     }
+
+    // 先把 embed config 写入子窗口（helper 会读取）
+    try { w.__TBH_EMBED_CONFIG__ = w.__TBH_EMBED_CONFIG__ || {}; } catch {}
 
     await loadScriptIntoWindow(w, ensureAbsolute(cfg.helperUrl));
     if (cfg.autoEval) {
@@ -557,7 +612,7 @@
   // 公共 API
   // ========================
   var state = {
-    version: '0.1.0',
+    version: '0.1.1',
     phase: 'idle',
     stopped: false,
     error: '',
@@ -576,7 +631,7 @@
     state.phase = 'preparing';
     emit('phase', { phase: state.phase, targetName: name });
 
-    await ensureInCourseCenter();
+    await ensureCourseCenterReady();
 
     state.phase = 'fetching_courses';
     emit('phase', { phase: state.phase });
@@ -597,7 +652,7 @@
 
   async function nextCourse() {
     state.stopped = false;
-    await ensureInCourseCenter();
+    await ensureCourseCenterReady();
     state.phase = 'fetching_courses';
     emit('phase', { phase: state.phase });
     var courses = await fetchAllCourses(30);
@@ -664,10 +719,28 @@
     };
   }
 
+  function getChildHelperState() {
+    try {
+      var w = state.courseTab;
+      if (!w || w.closed) return { ok: false, error: 'child_closed' };
+      if (!w.__TBH_HELPER__ || !w.__TBH_HELPER__.getState) return { ok: false, error: 'helper_not_ready' };
+      return { ok: true, state: w.__TBH_HELPER__.getState() };
+    } catch (e) {
+      return { ok: false, error: 'child_access_error', message: String(e && e.message ? e.message : e) };
+    }
+  }
+
+  function getLastChildState() {
+    // 通过 BroadcastChannel 收到的最近一次子窗口状态（不要求有 window 引用）
+    return lastBroadcast;
+  }
+
   window.__TBH_RUNNER__ = {
     version: state.version,
     configure: configure,
     getState: getState,
+    getChildHelperState: getChildHelperState,
+    getLastChildState: getLastChildState,
     startCourseByName: startCourseByName,
     nextCourse: nextCourse,
     resolvePostTestConfirm: resolvePostTestConfirm,

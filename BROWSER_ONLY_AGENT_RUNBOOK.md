@@ -17,11 +17,11 @@
 - 在项目根目录放置 `.env`（包含 TB_* 与 ZHIPU_* 等配置）。
 - Browser-only 注入脚本建议用 https 的脚本地址（GitHub Raw），避免 Mixed Content。
 
-默认（示例，建议使用 tag/commit 固定版本）：
+默认（示例，建议使用 tag/commit 固定版本）：（建议优先用 jsDelivr，GitHub Raw 在部分环境会连接被断开）
 
-- runner：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js`
-- helper：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js`
-- eval：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js`
+- runner：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js`
+- helper：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js`
+- eval：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js`
 
 ## 1. 登录
 
@@ -41,6 +41,10 @@
 `https://v4.21tb.com/els/html/index.parser.do?id=NEW_COURSE_CENTER&current_app_id=8a80810f5ab29060015ad1906d0b3811#!/els/html/courseCenter/courseCenter.loadStudyTask.do`
 
 点击目标课程卡片进入播放页（通常会新开一个 tab）。
+
+> 注意：有些环境会以“独立播放窗口/新窗口”形式打开课程，这是平台行为；runner 仍然可以通过 `window.open` 返回的窗口引用进行注入与自动化。
+
+如果这个独立窗口无法打开开发者工具，也不用担心：helper 会在窗口左上角显示 “TBH 已注入” 徽标，并且会把状态通过 `BroadcastChannel` 回传给课程中心页。
 
 ## 3. 在课程播放页注入（进入课程页后再注入）
 
@@ -64,12 +68,12 @@
     // zhipuApiKey 建议由 Agent 从 .env 读取后注入
     zhipuApiKey: '',
 
-    helperUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js',
-    evalAutoUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js',
+    helperUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js',
+    evalAutoUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js',
   };
 
   const s = document.createElement('script');
-  s.src = 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js';
+  s.src = 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js';
   s.onload = () => window.__TBH_RUNNER__?.startCourseByName?.('阳明心学——实践的哲学');
   (document.head || document.documentElement).appendChild(s);
 })();
@@ -79,6 +83,18 @@
 
 ```js
 window.__TBH_HELPER__?.getState?.()
+```
+
+若你仍停留在课程中心页（父窗口），也可查询子窗口注入是否成功：
+
+```js
+window.__TBH_RUNNER__?.getChildHelperState?.()
+```
+
+如果新开的独立播放窗口与父窗口之间无法直接互相访问（常见于某些容器隔离），可改用回传状态查询：
+
+```js
+window.__TBH_RUNNER__?.getLastChildState?.()
 ```
 
 关键字段：

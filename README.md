@@ -106,15 +106,19 @@ node scripts/21tb-login-crawler.js -e 你的企业ID -u 用户名 -p 密码 --au
 
 > 适用于：你希望直接使用 Agent 软件自带的浏览器完成登录/开课/自动播放/评估/课后测试，**不额外下载/安装浏览器**。
 
+> 注意：21tb 平台在开课时可能会弹出一个“独立播放窗口/新窗口”。这属于平台行为；runner 会把 helper/eval 注入到该窗口并继续运行（不影响自动学习）。
+>
+> 如果这个独立窗口无法打开开发者工具：helper 会在左上角显示 “TBH 已注入” 徽标；同时会把运行状态通过 `BroadcastChannel` 回传到课程中心页，你可在父窗口执行 `window.__TBH_RUNNER__.getLastChildState()` 查看。
+
 ### 1) 准备可被 https 页面加载的脚本地址（避免 Mixed Content）
 
 由于课程页是 `https://`，浏览器会阻止从 `http://127.0.0.1` 加载脚本（Mixed Content）。
 因此 Browser-only 默认使用 **https 资源地址**（推荐 GitHub Raw / 你自己的 https 静态站点）。
 
-示例（GitHub Raw，固定 tag/commit）：
-- runner：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js`
-- helper：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js`
-- eval：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js`
+示例（稳定 HTTPS 源，固定 tag/commit）：（建议优先用 jsDelivr，GitHub Raw 在部分环境会连接被断开）
+- runner：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js`
+- helper：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js`
+- eval：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js`
 
 > 稳定性建议：生产使用时建议把 `main` 替换为 **tag/commit hash**，避免脚本更新导致行为变化。
 
@@ -140,12 +144,12 @@ node scripts/21tb-login-crawler.js -e 你的企业ID -u 用户名 -p 密码 --au
     postTestApiBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     postTestApiTimeoutMs: 60000,
     zhipuApiKey: '<ZHIPU_API_KEY>',
-    helperUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js',
-    evalAutoUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js',
+    helperUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js',
+    evalAutoUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js',
   };
 
   const s = document.createElement('script');
-  s.src = 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js';
+  s.src = 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js';
   s.onload = () => window.__TBH_RUNNER__?.startCourseByName?.('阳明心学——实践的哲学');
   (document.head || document.documentElement).appendChild(s);
 })();

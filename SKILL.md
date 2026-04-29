@@ -91,10 +91,10 @@ POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认提交，默认 fa
 由于课程页是 `https://`，浏览器会阻止从 `http://127.0.0.1` 加载脚本（Mixed Content）。
 因此 **Browser-only 默认使用 https 资源地址**（推荐放在 GitHub Raw / 你自己的 https 静态站点）。
 
-推荐（GitHub Raw 示例，固定 tag/commit）：
-- Runner：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js`
-- 播放助手：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js`
-- 评估模块：`https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js`
+推荐（稳定 HTTPS 源，固定 tag/commit）：（建议优先用 jsDelivr，GitHub Raw 在部分环境会连接被断开）  
+- Runner：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js`
+- 播放助手：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js`
+- 评估模块：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js`
 
 > 稳定性建议：生产使用时建议把 `main` 替换为 **tag/commit hash**，避免脚本更新导致行为变化。
 
@@ -144,12 +144,12 @@ POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认提交，默认 fa
     zhipuApiKey: '<ZHIPU_API_KEY>',
 
     // 资源（需 https）
-    helperUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-video-helper.user.js',
-    evalAutoUrl: 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/scripts/21tb-evaluation-auto.js',
+    helperUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js',
+    evalAutoUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js',
   };
 
   const s = document.createElement('script');
-  s.src = 'https://raw.githubusercontent.com/Viennacacao/cloude_learning_skill/browser-only-v0.1.0/21tb-browser-only-runner.js';
+  s.src = 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js';
   s.onload = () => window.__TBH_RUNNER__?.startCourseByName?.('阳明心学——实践的哲学');
   (document.head || document.documentElement).appendChild(s);
 })();
