@@ -97,6 +97,16 @@ window.__TBH_RUNNER__?.getChildHelperState?.()
 window.__TBH_RUNNER__?.getLastChildState?.()
 ```
 
+当出现课后测试并需要对话确认时（`postTestConfirm.waiting === true`），在父窗口执行：
+
+```js
+// 确认提交
+window.__TBH_RUNNER__?.sendCommand?.('confirm_posttest')
+
+// 取消提交
+window.__TBH_RUNNER__?.sendCommand?.('cancel_posttest')
+```
+
 关键字段：
 - `state.progress.courseCompleted === true`：课程真正完成
 - `state.postTestConfirm.waiting === true`：出现课后测试确认点

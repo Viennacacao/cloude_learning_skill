@@ -108,7 +108,8 @@ node scripts/21tb-login-crawler.js -e 你的企业ID -u 用户名 -p 密码 --au
 
 > 注意：21tb 平台在开课时可能会弹出一个“独立播放窗口/新窗口”。这属于平台行为；runner 会把 helper/eval 注入到该窗口并继续运行（不影响自动学习）。
 >
-> 如果这个独立窗口无法打开开发者工具：helper 会在左上角显示 “TBH 已注入” 徽标；同时会把运行状态通过 `BroadcastChannel` 回传到课程中心页，你可在父窗口执行 `window.__TBH_RUNNER__.getLastChildState()` 查看。
+> 如果这个独立窗口无法打开开发者工具：helper 会在左上角显示 “TBH 已注入” 徽标；同时会把运行状态通过 `BroadcastChannel` 回传到课程中心页，你可在父窗口执行 `window.__TBH_RUNNER__.getLastChildState()` 查看。  
+> 当需要“对话确认提交课后测试”时，可在父窗口执行：`window.__TBH_RUNNER__.sendCommand('confirm_posttest')` 或 `sendCommand('cancel_posttest')`。
 
 ### 1) 准备可被 https 页面加载的脚本地址（避免 Mixed Content）
 

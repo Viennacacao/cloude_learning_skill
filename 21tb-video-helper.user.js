@@ -87,6 +87,18 @@
     bc = null;
   }
 
+  function handleCmdMessage(payload) {
+    try {
+      if (!payload || payload.type !== 'TBH_CMD') return;
+      const action = String(payload.action || '').toLowerCase();
+      if (action === 'confirm_posttest') confirmPostTestSubmit('confirm');
+      if (action === 'cancel_posttest') confirmPostTestSubmit('cancel');
+      if (action === 'start') startAutoPlay();
+      if (action === 'stop') stopAutoPlay();
+      broadcastState('cmd:' + action);
+    } catch (_) {}
+  }
+
   function safePostMessage(payload) {
     // 1) BroadcastChannel（同源多窗口最稳）
     try {
@@ -137,7 +149,7 @@
 
   function syncHelperApi() {
     window.__TBH_HELPER__ = {
-      version: '2.3.1',
+      version: '2.3.2',
       start: startAutoPlay,
       stop: stopAutoPlay,
       approvePostTestSubmit: () => confirmPostTestSubmit('confirm'),
@@ -229,6 +241,14 @@
   syncHelperApi();
   applyEmbeddedDefaults();
   startBroadcastLoop();
+
+  // 监听来自父窗口/同源窗口的控制命令（解决“独立播放窗口无法打开 DevTools、但需要远程确认/取消 post-test”的场景）
+  try {
+    if (bc) bc.onmessage = (ev) => handleCmdMessage(ev && ev.data);
+  } catch (_) {}
+  try {
+    window.addEventListener('message', (ev) => handleCmdMessage(ev && ev.data));
+  } catch (_) {}
 
   // ========================
   // UI 注入：控制面板 + 样式 + 拖拽

@@ -612,7 +612,7 @@
   // 公共 API
   // ========================
   var state = {
-    version: '0.1.1',
+    version: '0.1.2',
     phase: 'idle',
     stopped: false,
     error: '',
@@ -735,12 +735,35 @@
     return lastBroadcast;
   }
 
+  function sendCommand(action) {
+    // 1) 优先：如果能直接访问子窗口 helper，就直接调用（最可靠）
+    try {
+      var w = state.courseTab;
+      if (w && !w.closed && w.__TBH_HELPER__) {
+        var act = String(action || '').toLowerCase();
+        if (act === 'confirm_posttest') return w.__TBH_HELPER__.approvePostTestSubmit();
+        if (act === 'cancel_posttest') return w.__TBH_HELPER__.rejectPostTestSubmit();
+        if (act === 'start') return w.__TBH_HELPER__.start();
+        if (act === 'stop') return w.__TBH_HELPER__.stop();
+      }
+    } catch (_) {}
+
+    // 2) 回退：BroadcastChannel / postMessage（用于“独立播放窗口”隔离导致无法直接访问的情况）
+    try {
+      if (bc) bc.postMessage({ type: 'TBH_CMD', action: action });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   window.__TBH_RUNNER__ = {
     version: state.version,
     configure: configure,
     getState: getState,
     getChildHelperState: getChildHelperState,
     getLastChildState: getLastChildState,
+    sendCommand: sendCommand,
     startCourseByName: startCourseByName,
     nextCourse: nextCourse,
     resolvePostTestConfirm: resolvePostTestConfirm,
