@@ -21,8 +21,16 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { prepareEmbeddedPlayer, injectEmbeddedPlayerIntoCurrentPage, waitForEmbeddedPlayer, getEmbeddedPlayerState, isEvaluationPage, runEvaluationAuto, pollAndHandleEvaluation } = require('./21tb-player-embed');
+// 自动加载项目根目录 .env（便于“下载即用”，避免用户手动 export 环境变量）
+try {
+  // eslint-disable-next-line import/no-extraneous-dependencies
+  require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true });
+} catch (e) {
+  // ignore
+}
+const { prepareEmbeddedPlayer, ensureEmbeddedPlayerInjected, injectEmbeddedPlayerIntoCurrentPage, waitForEmbeddedPlayer, getEmbeddedPlayerState, isEvaluationPage, runEvaluationAuto, pollAndHandleEvaluation } = require('./21tb-player-embed');
 const { createRunReporter } = require('./21tb-status-reporter');
+const { isCourseCompleteStrict } = require('./21tb-progress-guard');
 
 function loadProjectEnv() {
   const envFile = path.join(__dirname, '..', '.env');
@@ -69,10 +77,13 @@ function parseArgs() {
     auto: false,
     autoAdvance: false,
     headless: false,
+    headful: false,
     jsonMode: false,
     progressLogsDir: '',
     autoEval: true,       // 默认开启评估自动完成
     agent: false,         // 面向 Agent 的对话式模式（单页串行、可退出）
+    userDataDir: '',      // 复用 Chrome profile（提升稳定性/避免重复登录）
+    chromePath: '',       // 指定 Chrome 可执行文件路径（优先级高于默认）
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -86,6 +97,9 @@ function parseArgs() {
       case '--no-auto-eval': opts.autoEval = false; break;
       case '--agent': opts.agent = true; break;
       case '--headless': opts.headless = true; break;
+      case '--headful': opts.headful = true; break;
+      case '--user-data-dir': case '--profile-dir': opts.userDataDir = args[++i] || ''; break;
+      case '--chrome-path': opts.chromePath = args[++i] || ''; break;
       case '--json': opts.jsonMode = true; break;
       case '--progress-logs': opts.progressLogsDir = args[++i] || ''; break;
       case '--help': case '-h':
@@ -105,6 +119,9 @@ function parseArgs() {
   --no-auto-eval           禁用评估自动完成（默认开启）
   --agent                  面向 Agent 的对话式模式（默认单页串行；完成后自动退出；建议配合 --json）
   --headless               无头模式（不显示浏览器窗口）
+  --headful                有头模式（显示浏览器窗口；用于调试/排障）
+  --user-data-dir <dir>    复用 Chrome 用户数据目录（提升稳定性/避免重复登录/保留缓存）
+  --chrome-path <path>     指定 Chrome 可执行文件路径（如系统未安装 Puppeteer 自带浏览器时）
   --json                   结构化 JSON 输出（每行一个 JSON 事件，适合 Agent/程序解析）
   --progress-logs [dir]    结构化进度日志目录（默认 cloud-video-learning/runtime-logs）
   -h, --help               显示帮助
@@ -1156,14 +1173,8 @@ function log(msg, level = 'info', options = {}) {
 }
 
 async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle, openOptions = {}) {
-  // 进入课程页后再注入（满足“只在课程页面注入”的约束）
-  await page.goto(courseUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: CONFIG.TIMEOUT,
-  });
-
-  // 修复：--no-auto-eval 需要真正生效（通过 autoEval 传入注入配置）
-  await injectEmbeddedPlayerIntoCurrentPage(page, {
+  // 注入配置（严格模式依赖 helper 进度；并要求刷新后自动重注入）
+  const embedConfig = {
     autoStart: true,
     autoStartDelayMs: 1800,
     defaultSpeed: 16,
@@ -1177,7 +1188,18 @@ async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle, openOp
     postTestApiBaseUrl: process.env.ZHIPU_API_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     postTestApiTimeoutMs: Number(process.env.POSTTEST_AI_TIMEOUT_MS) || 15000,
     zhipuApiKey: process.env.ZHIPU_API_KEY || '',
+  };
+
+  // 先设置 evaluateOnNewDocument，保证刷新/导航后仍自动注入
+  await prepareEmbeddedPlayer(page, embedConfig);
+
+  // 进入课程页后再兜底注入（满足“只在课程页面注入”的约束）
+  await page.goto(courseUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: CONFIG.TIMEOUT,
   });
+
+  await ensureEmbeddedPlayerInjected(page, embedConfig);
 
   const helperState = await waitForEmbeddedPlayer(page).catch(() => null);
   if (helperState) {
@@ -1403,7 +1425,11 @@ async function waitForCourseCompletion(page, course, options = {}) {
         });
       }
 
-      if (p.courseCompleted) return true;
+      // 严格门槛：totalResources=0 永不完成（避免 0/0 误判完成）
+      if (p.courseCompleted && !isCourseCompleteStrict(p)) {
+        log(`⚠️ 检测到可疑完成信号（totalResources=${p.totalResources}），已按严格模式忽略`, 'warn');
+      }
+      if (isCourseCompleteStrict(p)) return true;
     }
 
     await sleep(pollIntervalMs);
@@ -1561,7 +1587,9 @@ async function main() {
   if (opts.agent) {
     // Agent 模式：默认输出结构化事件，且尽量避免交互阻塞
     opts.jsonMode = true;
-    opts.headless = true;
+    if (!opts.headful) {
+      opts.headless = true;
+    }
   }
   // 优先使用命令行参数；未提供时回退到 .env / 环境变量
   // 这样可以避免在命令行里暴露账号密码（更安全，也更适合自动化）。
@@ -1613,10 +1641,21 @@ async function main() {
   let browser;
   let shouldCloseBrowser = !!(opts.headless || CONFIG.HEADLESS);
 
+  // Agent 模式默认复用 profile：减少重复登录 & 让缓存更稳定（可用 --user-data-dir 覆盖）
+  let userDataDir = opts.userDataDir;
+  if (opts.agent && !userDataDir) {
+    userDataDir = path.join(logsDir, 'chrome-profile');
+  }
+  if (userDataDir) {
+    try { fs.mkdirSync(userDataDir, { recursive: true }); } catch {}
+  }
+
   browser = await puppeteer.launch({
     headless: opts.headless || CONFIG.HEADLESS,
     slowMo: CONFIG.SLOW_MO,
     defaultViewport: { width: 1440, height: 900 },
+    executablePath: opts.chromePath || undefined,
+    userDataDir: userDataDir || undefined,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',

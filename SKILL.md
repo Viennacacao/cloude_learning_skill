@@ -35,11 +35,9 @@ cloud-video-learning/
 ├── .gitignore                        # 忽略 .env、runtime-logs、node_modules
 ├── scripts/
 │   ├── 21tb-login-crawler.js         # 主脚本：登录 + 课表 + 打开课程 + 自动播放 + 评估/测试
-│   ├── 21tb-course-launcher.js      # 辅助脚本：按名称/编号/ID 启动课程
 │   ├── 21tb-player-embed.js          # 内嵌播放助手注入器（无插件主链路）+ 配置下发
 │   ├── 21tb-evaluation-auto.js       # 课程评估自动完成模块（星级+选择题+论述+提交）
 │   ├── 21tb-status-reporter.js       # 结构化状态上报器（JSON 事件流 + 状态快照）
-│   ├── test-ai-solve.js              # AI 答题接口调试工具
 │   └── package.json                  # Node.js 依赖配置
 ├── runtime-logs/                     # 结构化进度日志（自动生成，不上传）
 ├── course-data.json                  # 课表缓存数据（自动生成，不上传）
@@ -64,21 +62,20 @@ ZHIPU_API_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
 
 # 选填：答题行为配置
 POSTTEST_AI_TIMEOUT_MS=60000       # AI 单批请求超时（毫秒），默认 60000
-POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认提交，默认 false（自动提交）
+POSTTEST_REQUIRE_CONFIRM=true      # 是否要求人工确认提交，默认 true（适合 Agent 自然对话）
 ```
 
 > **安全提示**：`.env` 文件已加入 `.gitignore`，不会同步到 GitHub。请勿将 API Key 等敏感信息直接写入代码。
 
 ## 工作流程
 
-### 默认（推荐）：Agent 内置浏览器 Browser-only 串行学习
+### 默认（推荐）：Puppeteer / 系统浏览器自动化（面向 Agent 自然对话）
 
-> 目标：**不依赖 Puppeteer、不下载/安装额外浏览器**，直接使用 Agent 软件自带浏览器完成：
-> 登录 → 进入课程 → **进入课程页后注入** → 自动播放/评估/课后测试 → 对话确认提交 → 完成。
+> 结论：由于 21tb 播放页在部分内置 WebView 中会出现 `ERR_BLOCKED_BY_ORB` 白屏问题，**优先使用 Puppeteer 驱动系统 Chrome/Chromium** 完成自动化。
 >
-> 约束：**同一时间只打开一门课**（串行）。
+> 能力：登录 → 抓课表 → 打开播放页 → 注入本地 helper/eval（不依赖 GitHub Raw）→ 自动播放/评估/课后测试 → **对话确认提交** → 完成回报。
 >
-> 默认行为：**只完成用户指定的课程并停下回报**。如用户在对话中输入“下一门/继续”，再自动推进到下一门未完成课程（仍然单课串行）。
+> 默认行为：只完成用户指定课程并停下回报；用户说“下一门/继续”时再推进下一门未完成课程。
 
 #### 对话命令（面向 Agent）
 
@@ -86,93 +83,72 @@ POSTTEST_REQUIRE_CONFIRM=false      # 是否要求人工确认提交，默认 fa
 - `下一门` / `继续`：在课程中心中选择“下一门未完成课程”并开始学习
 - `停止`：停止自动化（保持当前页面不再操作）
 
-#### Step 0：准备可被 https 页面加载的脚本地址（避免 Mixed Content）
+#### 一次性准备
 
-由于课程页是 `https://`，浏览器会阻止从 `http://127.0.0.1` 加载脚本（Mixed Content）。
-因此 **Browser-only 默认使用 https 资源地址**（推荐放在 GitHub Raw / 你自己的 https 静态站点）。
+在项目目录执行（安装 Puppeteer 依赖）：
 
-推荐（稳定 HTTPS 源，固定 tag/commit）：（建议优先用 jsDelivr，GitHub Raw 在部分环境会连接被断开）  
-- Runner：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js`
-- 播放助手：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js`
-- 评估模块：`https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js`
-
-> 稳定性建议：生产使用时建议把 `main` 替换为 **tag/commit hash**，避免脚本更新导致行为变化。
-
-> 本仓库内的 `scripts/21tb-asset-server.js` 可作为“本地调试/非 https 页面/自建 https 代理”时的资源服务，但不作为默认方案。
-
-#### Step 1：用 Agent 内置浏览器登录
-
-1. 打开登录页：`https://v4.21tb.com/login/login.init.do`
-2. 切换到密码登录（若默认是二维码）：点击 “Password login here”
-3. 填写：Company ID / Username / Password
-4. 若出现 “Continue/Cancel” 弹窗：点 Continue
-
-> 也支持自动登录：Runner 可在登录页读取 `__TBH_RUNNER_CONFIG__` 里的 `enterpriseId/username/password` 自动填表并提交。  
-> 推荐由 Agent 从本地 `.env` 读取后再注入（若缺失会提示用户输入）。
-
-#### Step 2：进入课程中心并打开指定课程
-
-课程中心（My Courses）：  
-`https://v4.21tb.com/els/html/index.parser.do?id=NEW_COURSE_CENTER&current_app_id=8a80810f5ab29060015ad1906d0b3811#!/els/html/courseCenter/courseCenter.loadStudyTask.do`
-
-打开课程后进入播放页（URL 通常包含）：`/courseSetting/courseLearning/play?...courseId=...`
-
-#### Step 3：进入课程页后注入 helper/eval（Browser-only）
-
-在课程中心页（My Courses）执行以下逻辑（通过 Agent 的浏览器 evaluate 注入）。Runner 会自动打开课程播放页，并在播放页内注入 helper/eval：
-
-```js
-(() => {
-  window.__TBH_RUNNER_CONFIG__ = {
-    // 登录（可选；用于自动登录）
-    enterpriseId: '<TB_ENTERPRISE_ID>',
-    username: '<TB_USER>',
-    password: '<TB_PASS>',
-
-    // helper 行为
-    autoStart: true,
-    autoStartDelayMs: 1800,
-    defaultSpeed: 16,
-    autoEval: true,
-
-    // 课后测试
-    postTestEnabled: true,
-    postTestRequireConfirm: true, // 若希望自动提交则设 false
-    postTestModel: 'glm-4-flash',
-    postTestApiBaseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-    postTestApiTimeoutMs: 60000,
-    zhipuApiKey: '<ZHIPU_API_KEY>',
-
-    // 资源（需 https）
-    helperUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-video-helper.user.js',
-    evalAutoUrl: 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/scripts/21tb-evaluation-auto.js',
-  };
-
-  const s = document.createElement('script');
-  s.src = 'https://cdn.jsdelivr.net/gh/Viennacacao/cloude_learning_skill@browser-only-v0.1.1/21tb-browser-only-runner.js';
-  s.onload = () => window.__TBH_RUNNER__?.startCourseByName?.('阳明心学——实践的哲学');
-  (document.head || document.documentElement).appendChild(s);
-})();
+```bash
+cd scripts
+npm install
 ```
 
-> 重要：上述 tag/commit 必须已推送到 GitHub 远端；若你尚未 push/tag，请先 push/tag，或临时把 URL 改为 `main`。
+准备 `.env`（建议放在项目根目录）：
+- `TB_ENTERPRISE_ID`
+- `TB_USER`
+- `TB_PASS`
+- 可选：`ZHIPU_API_KEY`（用于 AI 答题）
 
-> 安全提示：`zhipuApiKey` 建议由 Agent 从本地 `.env` 读取后再注入，避免写死在提示词/文档里。
+#### 运行（Agent 模式，结构化输出）
 
-#### Step 4：轮询状态并对话式确认提交
+只学指定课程并停下：
 
-反复读取：
-- `window.__TBH_HELPER__.getState().progress.courseCompleted`（true 表示课程真正完成）
-- `window.__TBH_HELPER__.getState().postTestConfirm.waiting`
+```bash
+node scripts/21tb-login-crawler.js --agent --json -c "阳明心学——实践的哲学"
+```
 
-当出现 `postTestConfirm.waiting === true`：
-- Agent 在对话中询问用户“是否提交课后测试？”
-- 用户确认：执行 `window.__TBH_HELPER__.approvePostTestSubmit()`
-- 用户取消：执行 `window.__TBH_HELPER__.rejectPostTestSubmit()`
+自动进入第一门未完成课程并学习（但不自动推进下一门）：
 
-当出现 `courseCompleted === true`：
-- Agent 回报“指定课程已完成”
-- 等待用户下一条对话指令（默认不自动跳转下一门；除非用户说“下一门/继续”）
+```bash
+node scripts/21tb-login-crawler.js --agent --json --auto
+```
+
+完成后自动推进下一门未完成课程：
+
+```bash
+node scripts/21tb-login-crawler.js --agent --json --auto --auto-advance
+```
+
+> 稳定性建议：Agent 模式默认会复用 `runtime-logs/chrome-profile` 作为 Chrome profile（减少重复登录、保留缓存）。也可用 `--user-data-dir` 指定。
+
+#### 统一入口（推荐给 Agent / 自然对话）
+
+为“下载即用”场景提供一个更短的入口脚本：`scripts/agent-entry.js`。
+
+```bash
+# 学习指定课程（完成后停下）
+node scripts/agent-entry.js 学习 "阳明心学——实践的哲学" --headful
+
+# 继续：学习第一门未完成课程（完成后停下）
+node scripts/agent-entry.js 继续 --headless
+
+# 全部：自动推进学完全部未完成课程
+node scripts/agent-entry.js 全部 --headless
+
+# 课后测试确认（最近一次）
+node scripts/agent-entry.js 确认
+node scripts/agent-entry.js 取消
+```
+
+#### 严格模式（0/0 不完成）
+
+默认启用严格完成判定：
+- 当课程页短时间内显示 `0/0`（资源列表未加载/未解析到）时，脚本不会把课程判定为完成，而会持续等待/重试。
+- crawler 侧也会要求 `totalResources>0` 才承认完成，避免误判。
+
+#### 对话式确认（post-test）
+
+脚本会在需要确认提交课后测试时输出 `posttest_confirm_required` 事件，并写入“决策文件提示”。  
+此时 Agent 在对话中询问用户“确认/取消”，并写入对应 decision 文件后，脚本会继续执行。
 
 ### 后备方案（可选）：Puppeteer 脚本一键全自动
 
@@ -213,17 +189,7 @@ node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码> --au
 node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码> --auto --no-auto-eval
 ```
 
-### 模式二：分步操作
-
-```bash
-# 步骤1：登录并获取课表
-node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码>
-
-# 步骤2：启动指定课程（需要已有有效登录态或缓存课表）
-node scripts/21tb-course-launcher.js "项目成本管理"
-node scripts/21tb-course-launcher.js --all-unfinished
-node scripts/21tb-course-launcher.js --interactive
-```
+（已移除旧的分步脚本：统一使用 `21tb-login-crawler.js` 完成登录/抓课/开课/学习。）
 
 ## 关键信息
 
@@ -287,8 +253,8 @@ node scripts/21tb-course-launcher.js --interactive
   - 每道题至少需要有 2 个选项才视为有效题目
   - 支持单选、多选、判断题自动识别
 - **提交策略**：
-  - 平均置信度 >= 70% 且无低置信度题时：**自动提交**
-  - 平均置信度 < 70% 或存在低置信度题时：**等待人工确认**（`POSTTEST_REQUIRE_CONFIRM=false` 时自动提交）
+  - `POSTTEST_REQUIRE_CONFIRM=true`：检测到需要确认时暂停，等待 Agent 对话确认（推荐）
+  - `POSTTEST_REQUIRE_CONFIRM=false`：尽量自动提交（更无人值守，但风险更大）
 - **题库自学习**：答题后将新学到的答案存入 `localStorage`，下次遇到相同题目直接命中
 
 ### 播放助手（浏览器侧核心逻辑）
@@ -335,8 +301,7 @@ node scripts/21tb-course-launcher.js --interactive
 ### 用户说"帮我启动课程XXX"
 
 1. 优先直接运行（同一会话内完成）：`node scripts/21tb-login-crawler.js -e ... -c "课程名"`
-2. 如需复用缓存课表且登录态有效：`node scripts/21tb-course-launcher.js "课程名"`
-3. 或用 `--all-unfinished` 启动所有未完成课程
+2. 或用 `--auto` / `--auto-advance` 完成未完成课程串行推进
 
 ### 用户说"把所有课都学了"
 
@@ -358,7 +323,6 @@ node scripts/21tb-login-crawler.js -e {企业ID} -u {用户名} -p {密码} --au
 ### 用户说"AI 答题不管用"或"想手动答题"
 
 - 检查 `.env` 中是否配置了 `ZHIPU_API_KEY`
-- 可运行 `node scripts/test-ai-solve.js` 测试 AI 接口是否正常
 - 确认智谱 API Key 余额充足
 
 ## 注意事项

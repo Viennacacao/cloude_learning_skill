@@ -98,6 +98,16 @@ async function prepareEmbeddedPlayer(page, config = {}) {
 }
 
 /**
+ * 常驻注入 + 当前页兜底注入（推荐在 Puppeteer 主链路使用）
+ * - evaluateOnNewDocument：保证刷新/导航到新 document 后仍注入
+ * - injectEmbeddedPlayerIntoCurrentPage：对当前已加载页面立即生效
+ */
+async function ensureEmbeddedPlayerInjected(page, config = {}) {
+  await prepareEmbeddedPlayer(page, config);
+  await injectEmbeddedPlayerIntoCurrentPage(page, config);
+}
+
+/**
  * 在“当前已加载的页面”里注入播放助手（用于：进入课程页后再注入）
  * @param {import('puppeteer').Page} page
  * @param {Object} config
@@ -162,6 +172,7 @@ async function getEmbeddedPlayerState(page) {
 
 module.exports = {
   prepareEmbeddedPlayer,
+  ensureEmbeddedPlayerInjected,
   injectEmbeddedPlayerIntoCurrentPage,
   waitForEmbeddedPlayer,
   getEmbeddedPlayerState,

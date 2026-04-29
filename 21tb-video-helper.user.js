@@ -15,6 +15,15 @@
   'use strict';
 
   // ========================
+  // 内部日志（用于调试/验收）
+  // ========================
+  const LOG_BUFFER_MAX = 200;
+  const logBuffer = [];
+  let lastAction = '';
+  let lastActionAt = '';
+  let lastActionDetail = null;
+
+  // ========================
   // 配置项
   // ========================
   const CONFIG = {
@@ -26,6 +35,8 @@
     CHECK_INTERVAL_MS: 1000, // 轮询检测间隔
     MAX_RETRIES: 90,         // 最大重试次数
     NEXT_BTN_DELAY_MS: 8000, // 「下一步」按钮出现后等待多久再点击
+    ADVANCE_DELAY_AFTER_ENDED_MS: 3000, // 视频播完后，延迟多久再点“下一节”（用于触发 completed）
+    STUCK_MAX: 5,            // 同一片段连续检测未推进多少次视为卡死
     POSTTEST_CONFIRM_TIMEOUT_MS: 15 * 60 * 1000, // 课后测试确认提交超时
     POSTTEST_BANK_KEY: 'TBH_POSTTEST_BANK_V1',
   };
@@ -66,9 +77,15 @@
     currentChapterIdx: -1,
     currentSectionIdx: -1,
     courseCompleted: false,
+    // 严格模式：是否曾经成功解析到资源列表（>0）
+    hasSeenResources: false,
     startedAt: null,
     lastActivityAt: null,
   };
+
+  // 防循环：卡死检测（连续多次停留在同一资源）
+  let lastResourceKey = '';
+  let stuckCount = 0;
 
   function getEmbedConfig() {
     return window.__TBH_EMBED_CONFIG__ || {};
@@ -94,7 +111,7 @@
       if (action === 'confirm_posttest') confirmPostTestSubmit('confirm');
       if (action === 'cancel_posttest') confirmPostTestSubmit('cancel');
       if (action === 'start') startAutoPlay();
-      if (action === 'stop') stopAutoPlay();
+      if (action === 'stop') stopAutoPlay('cmd');
       broadcastState('cmd:' + action);
     } catch (_) {}
   }
@@ -149,11 +166,12 @@
 
   function syncHelperApi() {
     window.__TBH_HELPER__ = {
-      version: '2.3.2',
+      version: '2.3.7',
       start: startAutoPlay,
-      stop: stopAutoPlay,
+      stop: (reason) => stopAutoPlay(reason || 'api'),
       approvePostTestSubmit: () => confirmPostTestSubmit('confirm'),
       rejectPostTestSubmit: () => confirmPostTestSubmit('cancel'),
+      _debug: () => buildDebugSnapshot(),
       getState: () => ({
         isRunning,
         currentSpeed,
@@ -163,12 +181,55 @@
         autoStart: !!getEmbedConfig().autoStart,
         url: window.location.href,
         progress: { ...playProgress },
+        logs: logBuffer.slice(-LOG_BUFFER_MAX),
         postTestConfirm: {
           waiting: postTestConfirmState.waiting,
           summary: postTestConfirmState.planSummary,
         },
         postTestProgress: { ...postTestProgress },
+        debug: {
+          lastAction,
+          lastActionAt,
+          lastActionDetail,
+        },
       }),
+    };
+  }
+
+  function buildDebugSnapshot() {
+    const nextBtn = document.querySelector('.info-next-text') || document.querySelector('.next-button') || null;
+    const replayBtn = document.querySelector('.replay-btn') || null;
+    const video = document.querySelector('video') || null;
+    const container =
+      document.querySelector('.chapter-container') ||
+      document.querySelector('.learning-container') ||
+      document.querySelector('.section-list') ||
+      document.querySelector('.catalogue-wrap') ||
+      null;
+    const comp = container ? getVueComponent(container) : null;
+    const courseData = comp && comp.$data ? comp.$data.courseData : null;
+    const curIndex = comp && comp.$data ? comp.$data.curIndex : null;
+    return {
+      url: location.href,
+      selectors: {
+        containerFound: !!container,
+        nextBtnFound: !!nextBtn,
+        replayBtnFound: !!replayBtn,
+        videoFound: !!video,
+      },
+      nextBtn: nextBtn ? { class: nextBtn.className, text: (nextBtn.textContent || '').trim(), disabled: !!nextBtn.disabled } : null,
+      replayBtn: replayBtn ? { class: replayBtn.className, text: (replayBtn.textContent || '').trim() } : null,
+      video: video ? { paused: video.paused, ended: video.ended, currentTime: video.currentTime, duration: video.duration, playbackRate: video.playbackRate } : null,
+      vue: {
+        hasComp: !!comp,
+        curIndex,
+        hasCourseData: !!courseData,
+        courseChapters: Array.isArray(courseData) ? courseData.length : 0,
+      },
+      progress: { ...playProgress },
+      lastAction,
+      lastActionAt,
+      lastActionDetail,
     };
   }
 
@@ -488,9 +549,11 @@
     const confirmSubmitBtn = document.getElementById('tbhConfirmSubmitBtn');
     const cancelSubmitBtn = document.getElementById('tbhCancelSubmitBtn');
 
-    startBtn.addEventListener('click', () => {
-      isRunning ? stopAutoPlay() : startAutoPlay();
-    });
+    if (startBtn) {
+      startBtn.addEventListener('click', () => {
+        isRunning ? stopAutoPlay('ui_button') : startAutoPlay();
+      });
+    }
     speedDownBtn.addEventListener('click', () => {
       if (currentSpeed > CONFIG.MIN_SPEED) {
         currentSpeed = Math.round((currentSpeed - CONFIG.SPEED_STEP) * 10) / 10;
@@ -514,8 +577,8 @@
       panel.classList.toggle('minimized');
       minBtn.textContent = panel.classList.contains('minimized') ? '□' : '—';
     });
-    confirmSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('confirm'));
-    cancelSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('cancel'));
+    if (confirmSubmitBtn) confirmSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('confirm'));
+    if (cancelSubmitBtn) cancelSubmitBtn.addEventListener('click', () => confirmPostTestSubmit('cancel'));
     makeDraggable(document.querySelector('.tbh-panel'), document.querySelector('.tbh-header'));
   }
 
@@ -548,6 +611,16 @@
   }
 
   function addLog(msg, level = 'info') {
+    try {
+      const now = new Date();
+      logBuffer.push({
+        at: now.toISOString(),
+        level,
+        msg: String(msg),
+      });
+      while (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
+    } catch (_) {}
+
     const logArea = document.getElementById('tbhLogArea');
     if (!logArea) return;
     const now = new Date();
@@ -631,8 +704,14 @@
 
   function getVueComponent(el) {
     let node = el;
-    while (node && !node.__vue__) { node = node.parentElement; }
-    return node ? node.__vue__ : null;
+    while (node) {
+      // Vue2
+      if (node.__vue__) return node.__vue__;
+      // Vue3
+      if (node.__vueParentComponent && node.__vueParentComponent.proxy) return node.__vueParentComponent.proxy;
+      node = node.parentElement;
+    }
+    return null;
   }
 
   function waitForCondition(checkFn, interval = CONFIG.CHECK_INTERVAL_MS, maxRetries = CONFIG.MAX_RETRIES) {
@@ -650,6 +729,60 @@
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  function findNextButtonEl() {
+    const btn = document.querySelector('.info-next-text') || document.querySelector('.next-button');
+    if (!btn) return null;
+    if (btn.offsetHeight <= 0) return null;
+    if (btn.disabled) return null;
+    return btn;
+  }
+
+  async function waitForNextButtonEl(timeoutMs = 15000) {
+    const start = Date.now();
+    while (isRunning && Date.now() - start < timeoutMs) {
+      const btn = findNextButtonEl();
+      if (btn) return btn;
+      await sleep(250);
+    }
+    return null;
+  }
+
+  async function handleAdvanceByNextButton(reason = 'unknown') {
+    // 统一处理：检测到 next 按钮 → 等 3 秒 → 点击 → 等待推进/消失
+    lastAction = 'advance_by_next_button';
+    lastActionAt = new Date().toISOString();
+    lastActionDetail = { reason, delayMs: CONFIG.ADVANCE_DELAY_AFTER_ENDED_MS };
+
+    addLog(`✅ 检测到 Next 按钮（${reason}），等待 ${CONFIG.ADVANCE_DELAY_AFTER_ENDED_MS / 1000}s 后点击以触发完成标记...`, 'info');
+    await sleep(CONFIG.ADVANCE_DELAY_AFTER_ENDED_MS);
+
+    // 3 秒内平台可能自动推进：若 next 已消失则直接返回
+    if (!findNextButtonEl()) {
+      addLog('✅ Next 按钮已消失，推测平台已自动推进，跳过点击', 'success');
+      return true;
+    }
+
+    const btn = await waitForNextButtonEl(3000);
+    if (!btn) {
+      addLog('⚠️ 未找到可点击的 Next 按钮（可能被隐藏/禁用），跳过本次点击', 'warn');
+      return false;
+    }
+
+    btn.click();
+    addLog('👉 已点击 Next 按钮', 'success');
+
+    // 等待按钮消失或视频重新开始（最多 20 秒）
+    const start = Date.now();
+    while (isRunning && Date.now() - start < 20000) {
+      await sleep(300);
+      if (!findNextButtonEl()) return true;
+      const v = document.querySelector('video');
+      if (v && v.currentTime < 1 && !v.ended) return true;
+    }
+    addLog('⚠️ 点击 Next 后未观察到推进迹象（按钮仍存在），稍后由主循环兜底处理', 'warn');
+    return false;
+  }
+
   function applySpeed() {
     const video = document.querySelector('video');
     if (video) { video.playbackRate = currentSpeed; }
@@ -662,8 +795,64 @@
     } catch (e) { }
   }
 
+  // 在播放器晚加载/异步挂载时，持续尝试设置倍速并触发播放
+  let speedEnforcerTimer = null;
+  let lastPlayAttemptAt = 0;
+  function startSpeedEnforcer() {
+    if (speedEnforcerTimer) return;
+    speedEnforcerTimer = setInterval(() => {
+      try {
+        applySpeed();
+        const video = document.querySelector('video');
+        // 重要：不要每秒都调用 play()，否则 AliPlayer 会疯狂刷屏 "do play successfully"
+        // 仅在 paused 且未 ended 时，做节流尝试（默认 5 秒一次）。
+        if (video && video.paused && !video.ended) {
+          const now = Date.now();
+          if (now - lastPlayAttemptAt >= 5000) {
+            lastPlayAttemptAt = now;
+            const p = video.play();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+          }
+        }
+      } catch (e) {}
+    }, 1000);
+  }
+  function stopSpeedEnforcer() {
+    try { if (speedEnforcerTimer) clearInterval(speedEnforcerTimer); } catch {}
+    speedEnforcerTimer = null;
+    lastPlayAttemptAt = 0;
+  }
+
+  async function waitForResourcesReady(maxWaitMs = 120000) {
+    const startAt = Date.now();
+    while (isRunning && (Date.now() - startAt) < maxWaitMs) {
+      const comp = getCoursePlayComponent();
+      const data = getCourseData(comp);
+      if (!comp || !data) {
+        addLog('课程组件/数据未就绪，等待加载...', 'warn');
+        await sleep(2000);
+        continue;
+      }
+      const resources = getAllResources(data);
+      if (resources.length > 0) return { comp, data, resources };
+      addLog('课程资源列表为空（0/0），等待课程目录加载...', 'warn');
+      // 关键：严格模式下 0/0 永不判定完成
+      playProgress.courseCompleted = false;
+      playProgress.totalResources = 0;
+      playProgress.finishedResources = 0;
+      playProgress.hasSeenResources = false;
+      syncHelperApi();
+      await sleep(2000);
+    }
+    return null;
+  }
+
   function getCoursePlayComponent() {
-    const el = document.querySelector('.chapter-container');
+    const el =
+      document.querySelector('.chapter-container') ||
+      document.querySelector('.learning-container') ||
+      document.querySelector('.section-list') ||
+      document.querySelector('.catalogue-wrap');
     return el ? getVueComponent(el) : null;
   }
 
@@ -1302,6 +1491,7 @@
     updateUI(true);
     syncHelperApi();
     addLog('🚀 自动播放已启动', 'success');
+    startSpeedEnforcer();
     try {
       if (isPostTestPage()) {
         await handlePostTest();
@@ -1309,25 +1499,32 @@
       }
       const comp = getCoursePlayComponent();
       if (!comp) {
-        addLog('未找到课程组件，切换到评估/测试监听模式', 'warn');
+        // 严格模式：先等待组件/资源加载，不直接进入“仅评估/测试模式”（避免 0/0 误判）
+        const ready = await waitForResourcesReady();
+        if (!ready) {
+          addLog('课程组件长期未就绪，切换到评估/测试监听模式', 'warn');
+          await waitAndHandleEvaluationOnlyMode();
+          return;
+        }
+      }
+      const ready2 = await waitForResourcesReady();
+      if (!ready2) {
+        addLog('课程资源长期为 0/0，切换到评估/测试监听模式', 'warn');
         await waitAndHandleEvaluationOnlyMode();
         return;
       }
-      const courseData = getCourseData(comp);
-      if (!courseData) {
-        addLog('未找到课程数据，切换到评估监听模式', 'warn');
-        await waitAndHandleEvaluationOnlyMode();
-        return;
-      }
-      const resources = getAllResources(courseData);
+
+      const resources = ready2.resources;
+      const comp2 = ready2.comp;
       addLog(`课程共 ${resources.length} 个资源`, 'info');
       const finished = resources.filter(r => r.finish).length;
       const unfinished = resources.length - finished;
       addLog(`已完成 ${finished}，未完成 ${unfinished}`, finished > 0 ? 'warn' : 'info');
       playProgress.totalResources = resources.length;
       playProgress.finishedResources = finished;
+      playProgress.hasSeenResources = resources.length > 0;
       syncHelperApi();
-      const curIdx = getCurrentResourceIndex(comp, resources);
+      const curIdx = getCurrentResourceIndex(comp2, resources);
       let startResource;
       if (curIdx >= 0 && !resources[curIdx].finish) {
         startResource = resources[curIdx];
@@ -1366,23 +1563,29 @@
         }
 
         // 确定都没有了，才标记课程完成
-        playProgress.courseCompleted = true;
-        playProgress.finishedResources = resources.length;
-        syncHelperApi();
-        addLog('🎉 课程内容及后续环节均已确认完成！', 'success');
-        stopAutoPlay();
+        if (resources.length > 0 && playProgress.hasSeenResources) {
+          playProgress.courseCompleted = true;
+          playProgress.finishedResources = resources.length;
+          syncHelperApi();
+          addLog('🎉 课程内容及后续环节均已确认完成！', 'success');
+          stopAutoPlay('course_completed');
+          return;
+        }
+        // 资源为空不允许完成：继续等待资源或后续页面出现
+        addLog('⚠️ 当前资源列表为空，无法确认课程完成，继续等待...', 'warn');
+        await sleep(3000);
         return;
       }
         addLog(`跳转到未完成内容: ${startResource.resourceName}`, 'warn');
-        switchToSection(comp, startResource.chapterIdx, startResource.sectionIdx);
+        switchToSection(comp2, startResource.chapterIdx, startResource.sectionIdx);
         await sleep(CONFIG.NEXT_WAIT_MS * 2);
       }
-      await playLoop(comp, resources);
+      await playLoop(comp2, resources);
     } catch (e) {
       addLog(`发生异常: ${e.message}`, 'error');
       console.error('[时光易学助手]', e);
     }
-    stopAutoPlay();
+    stopAutoPlay('startAutoPlay_end');
   }
 
   async function waitAndHandleEvaluationOnlyMode(maxWaitMs = 30 * 60 * 1000) {
@@ -1441,13 +1644,23 @@
   }
 
   function stopAutoPlay() {
+    const reason = arguments.length ? arguments[0] : 'unknown';
+    // 记录停止来源，便于排查“为何一播完就 stop/刷新/重启”
+    try {
+      lastAction = 'stop_auto_play';
+      lastActionAt = new Date().toISOString();
+      const stack = (new Error('stopAutoPlay:' + reason).stack || '').split('\n').slice(0, 8).join('\n');
+      lastActionDetail = { reason, stack };
+    } catch (_) {}
+
     isRunning = false;
+    stopSpeedEnforcer();
     if (postTestConfirmState.waiting) {
       confirmPostTestSubmit('cancel');
     }
     updatePostTestProgress({ active: false, stage: 'idle', summary: '待命' });
     updateUI(false);
-    addLog('⏹ 自动播放已停止', 'warn');
+    addLog(`⏹ 自动播放已停止（原因：${reason}）`, 'warn');
   }
 
   async function playLoop(comp, resources) {
@@ -1463,6 +1676,15 @@
         }
         break;
       }
+
+      // 关键兜底：即使拿不到 Vue 组件/资源列表，只要 next 按钮出现（你确认是“播完才出现”），就按规则“等3秒→点next”
+      // 这能解决：curIndex=null、resources=0 时无法进入推进分支导致的重复播放/误刷新。
+      if (findNextButtonEl()) {
+        await handleAdvanceByNextButton('playLoop_precheck');
+        await sleep(CONFIG.NEXT_WAIT_MS);
+        continue;
+      }
+
       const freshComp = getCoursePlayComponent();
       if (!freshComp) { addLog('课程组件丢失，尝试恢复...', 'warn'); await sleep(3000); continue; }
       const freshData = getCourseData(freshComp);
@@ -1473,20 +1695,51 @@
       if (curIdx < 0) { addLog('无法定位当前播放位置，等待...', 'warn'); await sleep(3000); continue; }
       const current = freshResources[curIdx];
 
+      // 防循环：连续停留在同一资源（可能“下一节”未触发 completed 导致回播）
+      const curKey = String(current.resourceId || current.resourceName || '');
+      if (curKey && curKey === lastResourceKey) {
+        stuckCount++;
+      } else {
+        lastResourceKey = curKey;
+        stuckCount = 0;
+      }
+
       // 回写进度
       playProgress.totalResources = freshResources.length;
       playProgress.finishedResources = freshFinished;
+      if (freshResources.length > 0) playProgress.hasSeenResources = true;
       playProgress.currentResourceName = current.resourceName;
       playProgress.currentChapterIdx = current.chapterIdx;
       playProgress.currentSectionIdx = current.sectionIdx;
       // 只有在资源数大于0且全部完成，且没有测试/评估的情况下才算课程完成
       // 如果资源数为0，必须经过评估或测试流程才算完成
-      playProgress.courseCompleted = (freshResources.length > 0 && freshFinished === freshResources.length && !isPostTestPage() && !isCourseEvaluatePage());
+      playProgress.courseCompleted = (
+        playProgress.hasSeenResources &&
+        freshResources.length > 0 &&
+        freshFinished === freshResources.length &&
+        !isPostTestPage() &&
+        !isCourseEvaluatePage()
+      );
       playProgress.lastActivityAt = new Date().toISOString();
       syncHelperApi();
 
       addLog(`▶ 正在播放: ${current.resourceName}`, 'info');
       applySpeed();
+
+      // 混合策略 1：若当前片段已完成，立即跳过到下一节（不等待 3 秒）
+      if (current.finish) {
+        addLog(`⏩ 当前片段已完成，立即跳过：${current.resourceName}`, 'warn');
+        const next = findNextUnfinished(freshResources, curIdx);
+        if (!next) {
+          addLog('已无未完成片段，等待评估/测试或平台同步...', 'info');
+          await sleep(2000);
+          continue;
+        }
+        // 优先组件切换，避免反复点按钮导致循环
+        switchToSection(freshComp, next.chapterIdx, next.sectionIdx);
+        await sleep(CONFIG.NEXT_WAIT_MS);
+        continue;
+      }
       const btnResult = await waitForNextButton();
       if (!isRunning) break;
       if (btnResult === 'rewatch') {
@@ -1547,33 +1800,41 @@
           continue;
         }
         addLog('⚠️ 未检测到按钮，可能视频未正常结束', 'warn');
-        await sleep(3000);
-      }
-      addLog('等待 8 秒后点击「下一步」...', 'info');
-      let waitSeconds = 0;
-      while (waitSeconds < CONFIG.NEXT_BTN_DELAY_MS / 1000 && isRunning) { await sleep(1000); waitSeconds++; addLog(`倒计时 ${CONFIG.NEXT_BTN_DELAY_MS / 1000 - waitSeconds}s...`, 'info'); }
-      if (!isRunning) break;
-      const nextUnfinished = findNextUnfinished(freshResources, curIdx);
-      if (!nextUnfinished) {
-        // 先检查是否有延迟出现的测试/评估
-        addLog('⏳ 正在检查是否有后续测试或评估...', 'info');
-        await sleep(5000);
-        if (isPostTestPage() || isCourseEvaluatePage()) {
-          continue; // 让循环继续，去处理测试/评估
+        // 卡死兜底：同一片段反复检测未推进，则尝试“播完→3秒→点下一节”，仍失败则刷新
+        if (stuckCount >= CONFIG.STUCK_MAX) {
+          addLog(`🧷 卡死检测触发（${stuckCount} 次），执行兜底推进...`, 'warn');
+          const video = document.querySelector('video');
+          const ended = !!(video && video.ended);
+          if (ended) {
+            // 等待 next 按钮真正出现（你确认“播完才出现”，但可能会有短延迟）
+            await waitForNextButtonEl(12000);
+            const ok = await handleAdvanceByNextButton('stuck_ended');
+            if (!ok) {
+              const next = findNextUnfinished(freshResources, curIdx);
+              if (next) {
+                addLog('未找到按钮，改用组件切换下一节', 'warn');
+                switchToSection(freshComp, next.chapterIdx, next.sectionIdx);
+              } else {
+                addLog('未找到下一未完成片段，刷新页面同步状态', 'warn');
+                window.location.reload();
+                return;
+              }
+            }
+            stuckCount = 0;
+            await sleep(CONFIG.NEXT_WAIT_MS);
+            continue;
+          }
         }
-
-        playProgress.courseCompleted = true;
-        playProgress.finishedResources = freshResources.length;
-        syncHelperApi();
-        addLog('🎉 所有课程内容及后续环节均已完成！', 'success');
-        break;
+        await sleep(3000);
+        continue;
       }
-      let clicked = clickNextButton();
-      if (clicked) { addLog(`已点击下一节 → ${nextUnfinished.resourceName}`, 'success'); }
-      else { addLog('未找到下一节按钮，尝试 Vue 方法切换', 'warn'); switchToSection(freshComp, nextUnfinished.chapterIdx, nextUnfinished.sectionIdx); }
-      addLog('等待下一节加载...', 'info');
-      await sleep(CONFIG.NEXT_WAIT_MS);
-      await skipFinishedSections(freshComp, freshResources);
+      // 混合策略 2：当前未完成片段 —— 播完后等待 3 秒，再点击“下一节”触发 completed
+      if (btnResult === 'next') {
+        // 统一用 handleAdvanceByNextButton，避免逻辑分叉导致“没等3秒/误刷新”
+        await handleAdvanceByNextButton('btnResult_next');
+        await sleep(CONFIG.NEXT_WAIT_MS);
+        continue;
+      }
     }
   }
 
@@ -1585,10 +1846,11 @@
         if (!isRunning) { clearInterval(checkTimer); done(false); return; }
         if (isPostTestPage()) { clearInterval(checkTimer); addLog('🧠 检测到课后测试页面', 'success'); done('posttest'); return; }
         if (isCourseEvaluatePage()) { clearInterval(checkTimer); addLog('📝 检测到课程评估页面', 'success'); done('evaluate'); return; }
-        const replayBtn = document.querySelector('.replay-btn');
-        if (replayBtn && replayBtn.offsetHeight > 0) { clearInterval(checkTimer); addLog('🔄 检测到「重看」按钮（最后一节已完成）', 'success'); done('rewatch'); return; }
         const nextBtn = document.querySelector('.info-next-text, .next-button');
         if (nextBtn && nextBtn.offsetHeight > 0) { clearInterval(checkTimer); addLog('✅ 「下一步」按钮已出现', 'success'); done('next'); return; }
+        // 注意：有些页面可能同时存在 replay 与 next（或 replay 提前出现），这里必须以 next 优先，避免误触发 reload
+        const replayBtn = document.querySelector('.replay-btn');
+        if (replayBtn && replayBtn.offsetHeight > 0) { clearInterval(checkTimer); addLog('🔄 检测到「重看」按钮（最后一节已完成）', 'success'); done('rewatch'); return; }
         const comp = getVueComponent(document.querySelector('.chapter-container'));
         if (comp && comp.visibleNextClick === true) {
           const replayEl = document.querySelector('.replay-btn');
@@ -1626,8 +1888,15 @@
         addLog(`⏩ 跳过已完成: ${freshResources[curIdx].resourceName}`, 'warn');
         const next = findNextUnfinished(freshResources, curIdx);
         if (!next) { addLog('🎉 所有课程已全部完成！', 'success'); isRunning = false; break; }
-        const clicked = clickNextButton();
-        if (!clicked) { switchToSection(freshComp, next.chapterIdx, next.sectionIdx); }
+        // 已完成片段：优先组件切换（更稳定，不依赖按钮）
+        switchToSection(freshComp, next.chapterIdx, next.sectionIdx);
+        // 兜底：组件切换若未生效（例如方法不存在/异常），再尝试点击按钮
+        await sleep(CONFIG.NEXT_WAIT_MS);
+        const curIdx2 = getCurrentResourceIndex(getCoursePlayComponent() || freshComp, getAllResources(getCourseData(getCoursePlayComponent() || freshComp) || freshData));
+        if (curIdx2 === curIdx) {
+          const clicked = clickNextButton();
+          if (clicked) addLog('组件切换未推进，已改用按钮点击下一节', 'warn');
+        }
       } else { break; }
     }
   }
