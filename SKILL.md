@@ -145,6 +145,21 @@ node scripts/agent-entry.js 取消
 - 当课程页短时间内显示 `0/0`（资源列表未加载/未解析到）时，脚本不会把课程判定为完成，而会持续等待/重试。
 - crawler 侧也会要求 `totalResources>0` 才承认完成，避免误判。
 
+#### 调试三连（课程播放页 Console）
+
+当遇到“重复播放 / 不点 Next / 不加速 / 刷新后异常”等问题时，在课程播放页打开 DevTools → Console 执行：
+
+```js
+window.__TBH_HELPER__?.version
+window.__TBH_HELPER__?._debug?.()
+window.__TBH_HELPER__?.getState?.().logs?.slice(-30)
+```
+
+说明：
+- `version`：确认注入的 helper 是否为最新版本
+- `_debug()`：查看是否命中 next/replay 按钮、video ended 状态、Vue 数据是否可读、最近一次动作
+- `logs`：查看最近 30 条内部决策日志（是否真的等 3 秒后点击 Next、是否触发兜底等）
+
 #### 对话式确认（post-test）
 
 脚本会在需要确认提交课后测试时输出 `posttest_confirm_required` 事件，并写入“决策文件提示”。  
