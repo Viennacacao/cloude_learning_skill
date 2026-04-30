@@ -348,6 +348,10 @@
         return { success: true, steps: { alreadyDone: true } };
       }
 
+      // 等待页面完全加载后再开始填写
+      this.log('⏳ 等待 3 秒让评估页面完全加载...');
+      await new Promise(r => setTimeout(r, 3000));
+
       // 合并配置
       if (options.starRating) EVAL_CONFIG.starRating = options.starRating;
       if (options.choiceOption) EVAL_CONFIG.choiceOption = options.choiceOption.toLowerCase();

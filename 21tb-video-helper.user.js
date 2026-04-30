@@ -35,7 +35,7 @@
     CHECK_INTERVAL_MS: 1000, // 轮询检测间隔
     MAX_RETRIES: 90,         // 最大重试次数
     NEXT_BTN_DELAY_MS: 8000, // 「下一步」按钮出现后等待多久再点击
-    ADVANCE_DELAY_AFTER_ENDED_MS: 3000, // 视频播完后，延迟多久再点“下一节”（用于触发 completed）
+    ADVANCE_DELAY_AFTER_ENDED_MS: 6000, // 视频播完后，延迟多久再点"下一节"（用于触发 completed）
     STUCK_MAX: 5,            // 同一片段连续检测未推进多少次视为卡死
     POSTTEST_CONFIRM_TIMEOUT_MS: 15 * 60 * 1000, // 课后测试确认提交超时
     POSTTEST_BANK_KEY: 'TBH_POSTTEST_BANK_V1',
@@ -953,6 +953,7 @@
     return {
       enabled: cfg.postTestEnabled !== false,
       requireConfirm: cfg.postTestRequireConfirm !== false,
+      skipBank: cfg.postTestSkipBank === true,
       lowConfidenceThreshold: Number(cfg.postTestLowConfidenceThreshold) || 0.65,
       autoSubmitThreshold: Number(cfg.postTestAutoSubmitThreshold) || 0.7,
       model: cfg.postTestModel || 'glm-4-flash',
@@ -1332,6 +1333,29 @@
   async function handlePostTest() {
     const cfg = getPostTestConfig();
     if (!cfg.enabled || !isPostTestPage()) return false;
+
+    // 等待页面完全加载后再开始答题
+    addLog('⏳ 检测到课后测试页面，等待 3 秒让页面完全加载...', 'info');
+    await sleep(3000);
+
+    // 检测是否存在 "Take Re-take Exam" 按钮（上次答题未通过时出现），自动点击重新考试
+    const retakeSelectors = [
+      'button.ant-btn.ant-btn-primary',
+      '.ant-btn.ant-btn-primary',
+    ];
+    for (const sel of retakeSelectors) {
+      const retakeBtns = document.querySelectorAll(sel);
+      for (const btn of retakeBtns) {
+        if (btn.textContent && btn.textContent.includes('Take Re-take Exam') && !btn.disabled) {
+          console.log('[TBH-PostTest] detected "Take Re-take Exam" button, clicking to re-take exam');
+          addLog('🔄 检测到 "Take Re-take Exam" 按钮，自动点击重新考试...', 'info');
+          btn.click();
+          await sleep(3000); // 等待页面刷新加载新的题目
+          break;
+        }
+      }
+    }
+
     const context = findPostTestContext();
     const postTestDoc = context.doc || document;
 
@@ -1367,36 +1391,53 @@
     const bank = loadPostTestBank();
     const unresolved = [];
     const planItems = [];
-    for (const q of questions) {
-      const hit = findBankAnswer(bank, q);
-      if (hit) {
-        planItems.push({
-          ...q,
-          answer: normalizeAnswerForType(hit.answer, q.type),
-          confidence: Math.min(0.99, Number(hit.confidence) || 0.9),
-          source: 'bank',
-          reason: '题库命中',
-        });
-      } else {
-        unresolved.push(q);
+    if (cfg.skipBank) {
+      // 跳过题库，所有题目都交给 AI 解答
+      addLog(`POSTTEST_SKIP_BANK=true，跳过题库，全部 ${questions.length} 题交给 AI 解答`, 'info');
+      unresolved.push(...questions);
+    } else {
+      for (const q of questions) {
+        const hit = findBankAnswer(bank, q);
+        if (hit) {
+          planItems.push({
+            ...q,
+            answer: normalizeAnswerForType(hit.answer, q.type),
+            confidence: Math.min(0.99, Number(hit.confidence) || 0.9),
+            source: 'bank',
+            reason: '题库命中',
+          });
+        } else {
+          unresolved.push(q);
+        }
       }
     }
     const fromBankCount = planItems.length;
 
     if (unresolved.length > 0) {
-      const BATCH_SIZE = 10;
+      const BATCH_SIZE = 5;
       const totalBatches = Math.ceil(unresolved.length / BATCH_SIZE);
+      const MAX_RETRY = 3;
+      const RETRY_DELAY_MS = 5000;
       addLog(`题库命中 ${questions.length - unresolved.length}/${questions.length}，分 ${totalBatches} 批调用 AI 解答 ${unresolved.length} 题`, 'info');
-      
+
       for (let i = 0; i < unresolved.length; i += BATCH_SIZE) {
         const batch = unresolved.slice(i, i + BATCH_SIZE);
         const batchNum = Math.floor(i / BATCH_SIZE) + 1;
         updatePostTestProgress({ stage: 'solving', summary: `正在通过 AI 解答第 ${batchNum}/${totalBatches} 批题目...` });
-        
-        const aiRet = await callZhipuSolve(batch, cfg);
+
+        let aiRet = { ok: false, error: '' };
+        for (let retry = 0; retry < MAX_RETRY; retry++) {
+          aiRet = await callZhipuSolve(batch, cfg);
+          if (aiRet.ok) break;
+          // 429 限流或网络错误时重试
+          if (retry < MAX_RETRY - 1 && (aiRet.error?.includes('429') || aiRet.error?.includes('abort') || aiRet.error?.includes('fetch'))) {
+            addLog(`⚠️ 第 ${batchNum} 批 AI 请求失败（${aiRet.error}），${RETRY_DELAY_MS / 1000}秒后重试 (${retry + 1}/${MAX_RETRY})`, 'warn');
+            await sleep(RETRY_DELAY_MS * (retry + 1)); // 递增延迟
+          }
+        }
         if (!aiRet.ok) {
-          console.log(`[TBH-PostTest] AI batch ${batchNum} solve failed: ${aiRet.error}`);
-          addLog(`⚠️ 第 ${batchNum} 批 AI 解答失败：${aiRet.error}，使用兜底答案`, 'warn');
+          console.log(`[TBH-PostTest] AI batch ${batchNum} solve failed after ${MAX_RETRY} retries: ${aiRet.error}`);
+          addLog(`⚠️ 第 ${batchNum} 批 AI 解答失败（已重试 ${MAX_RETRY} 次）：${aiRet.error}，使用兜底答案`, 'warn');
         }
 
         batch.forEach((q) => {

@@ -1182,6 +1182,7 @@ async function openCourseWithEmbeddedPlayer(page, courseUrl, courseTitle, openOp
     autoEval: openOptions.autoEval !== false,
     postTestEnabled: true,
     postTestRequireConfirm: String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true',
+    postTestSkipBank: String(process.env.POSTTEST_SKIP_BANK || '').toLowerCase() === 'true',
     postTestLowConfidenceThreshold: 0.65,
     postTestAutoSubmitThreshold: 0.7,
     postTestModel: process.env.ZHIPU_MODEL || 'glm-4-flash',

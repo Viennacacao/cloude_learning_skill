@@ -29,6 +29,7 @@ function normalizeConfig(config = {}) {
     // 课后测试自动答题配置
     postTestEnabled: config.postTestEnabled !== false,
     postTestRequireConfirm: config.postTestRequireConfirm !== false,
+    postTestSkipBank: config.postTestSkipBank === true,
     postTestLowConfidenceThreshold: Number(config.postTestLowConfidenceThreshold) || 0.65,
     postTestAutoSubmitThreshold: Number(config.postTestAutoSubmitThreshold) || 0.7,
     postTestModel: config.postTestModel || 'glm-4-flash',
