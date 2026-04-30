@@ -1391,6 +1391,13 @@ async function waitForCourseCompletion(page, course, options = {}) {
       }
     }
 
+    // 课后测试完成也是课程完成的充分条件（即使页面跳转后 totalResources=0）
+    if (emittedPostTestComplete) {
+      log(`✅ ${course.title}：课后测试已完成，判定课程完成`, 'info');
+      return true;
+    }
+
+    // 评估完成且无课后测试要求（graduation=Course Assessment）也算完成
     if (state && state.progress) {
       const p = state.progress;
       const percent = p.totalResources > 0 ? Math.round((p.finishedResources / p.totalResources) * 100) : 0;
