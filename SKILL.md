@@ -1,11 +1,11 @@
 ---
 name: 云端视频学习
-description: 自动化完成 21tb「时光易学」平台的在线课程学习：一键登录、获取课表、自动播放；视频结束后自动提交课程评估，并可选用智谱 AI 自动完成课后测试。
+description: 自动化完成 21tb「时光易学」平台的在线课程学习：一键登录、获取课表、自动播放；视频结束后自动点击 Steps 导航进入评估页并提交课程评估，并可选用 DeepSeek / 智谱 AI 自动完成课后测试。
 ---
 
 # 云端视频学习 Skill
 
-自动化完成 21tb 时光易学平台的在线课程学习。用户只需提供企业ID、账号、密码，即可一键登录、获取课表、启动课程播放，**视频播完后自动填写并提交课程评估，课后测试通过 AI 自动答题**。
+自动化完成 21tb 时光易学平台的在线课程学习。用户只需提供企业ID、账号、密码，即可一键登录、获取课表、启动课程播放，**视频播完后自动点击 Steps 导航进入评估页、填写并提交课程评估，课后测试通过 AI 自动答题**（支持 DeepSeek / 智谱等 OpenAI 兼容 API）。
 
 ## 触发条件
 
@@ -23,7 +23,7 @@ description: 自动化完成 21tb「时光易学」平台的在线课程学习�
 1. **Node.js** >= 18
 2. **浏览器依赖**：运行 `cd scripts && npm install` 安装 puppeteer 及相关依赖
 3. **Tampermonkey（可选）**：`21tb-video-helper.user.js` 作为浏览器侧后备方案
-4. **智谱 AI API Key（可选）**：用于课后测试 AI 自动答题，配置在 `.env` 文件中
+4. **AI API Key（可选）**：用于课后测试 AI 自动答题，支持 OpenAI 兼容端点（DeepSeek、智谱等），配置在 `.env` 文件中
 
 ## 文件结构
 
@@ -54,15 +54,15 @@ TB_ENTERPRISE_ID=你的企业ID
 TB_USER=你的用户名
 TB_PASS=你的密码
 
-# 选填：智谱 AI（用于课后测试自动答题）
-# 从 https://open.bigmodel.cn/ 获取 API Key
+# 选填：AI 自动答题（支持 DeepSeek、智谱等 OpenAI 兼容 API）
 ZHIPU_API_KEY=your_key_here
-ZHIPU_MODEL=glm-4-flash
-ZHIPU_API_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
+ZHIPU_MODEL=deepseek-v4-flash
+ZHIPU_API_BASE_URL=https://api.deepseek.com/v1
 
 # 选填：答题行为配置
 POSTTEST_AI_TIMEOUT_MS=60000       # AI 单批请求超时（毫秒），默认 60000
 POSTTEST_REQUIRE_CONFIRM=true      # 是否要求人工确认提交，默认 true（适合 Agent 自然对话）
+POSTTEST_SKIP_BANK=true            # 是否跳过本地题库，默认 false
 ```
 
 > **安全提示**：`.env` 文件已加入 `.gitignore`，不会同步到 GitHub。请勿将 API Key 等敏感信息直接写入代码。
@@ -211,7 +211,7 @@ node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码> --au
 ### 平台信息
 
 - 平台地址：`https://v4.21tb.com/`
-- 技术栈：Vue 2 + jQuery + 阿里云播放器 + Ant Design 组件库
+- 技术栈：Vue 2 + jQuery + 阿里云播放器 + Element UI / Ant Design 组件库
 - 登录页：`/login/login.init.do`（默认二维码）
 - 课程中心：`/els/html/courseCenter/courseCenter.loadStudyTask.do`
 - 播放页模板：`/courseSetting/courseLearning/play?courseType=NEW_COURSE_CENTER&courseId={id}`
@@ -243,16 +243,17 @@ node scripts/21tb-login-crawler.js -e <企业ID> -u <用户名> -p <密码> --au
 
 ### 课程评估（自动完成）
 
-- **触发时机**：某门课程所有视频资源播放完毕后，平台自动跳转到 Course Evaluation 页面
-- **检测方式**：轮询检测 `.course-evaluate` 容器是否存在（同时检测主文档和同域 iframe）
+- **触发时机**：某门课程所有视频资源播放完毕后，页面停留在 Steps 导航页，脚本自动点击 "Course Evaluation" 步骤进入评估页
+- **检测方式**：轮询检测 `.el-rate` / `.ant-rate`（Element UI / Ant Design 星级评分组件）+ 提交按钮是否存在，兼容 21tb 前端框架迁移
 - **自动执行动作**：
-  1. 星级评分 → 5 颗星（`.ant-rate[role=radiogroup]`）
-  2. 单选题（通常 4 道）→ 全部选 D（`.ant-radio-wrapper` 匹配 label 为 D 的项）
-  3. 问答题（1 道）→ 固定填「很不错，高效」（`textarea.ant-input`）
-  4. 点击提交（`.course-evaluate-footer .ant-btn-primary`）
+  1. 星级评分 → 5 颗星（`.el-rate` / `.ant-rate`）
+  2. 单选题（通常 4 道）→ 全部选 D（`.el-radio` / `.ant-radio-wrapper`）
+  3. 问答题（1 道）→ 固定填「很不错，高效」（`textarea`）
+  4. 点击提交（`.ant-btn-primary` / `.el-button--primary`）
   5. 处理提交后弹窗（点击"进入下一步"）
 - **默认开启**，可用 `--no-auto-eval` 关闭
 - **模块位置**：`scripts/21tb-evaluation-auto.js`，通过 `21tb-player-embed.js` 注入
+- **最近更新**：2026-07-03 适配 21tb 前端从 Ant Design 迁移到 Element UI，新增 Steps 导航自动点击逻辑
 
 ### 课后测试（AI 自动答题）
 
@@ -337,8 +338,8 @@ node scripts/21tb-login-crawler.js -e {企业ID} -u {用户名} -p {密码} --au
 
 ### 用户说"AI 答题不管用"或"想手动答题"
 
-- 检查 `.env` 中是否配置了 `ZHIPU_API_KEY`
-- 确认智谱 API Key 余额充足
+- 检查 `.env` 中是否配置了 `ZHIPU_API_KEY`（变量名保留历史兼容，实际支持 DeepSeek / 智谱等）
+- 确认 API Key 余额充足、baseURL 正确（DeepSeek: `https://api.deepseek.com/v1`，智谱: `https://open.bigmodel.cn/api/paas/v4/chat/completions`）
 
 ## 注意事项
 

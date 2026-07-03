@@ -74,10 +74,23 @@
 
     /**
      * 检测当前页面是否是 Course Evaluation 页面
+     * 
+     * 2026-07-03 修复：21tb 评估页从前端 Ant Design 迁移到 Element UI，
+     * 不再有 .course-evaluate 容器。改为检测评估表单特征元素：
+     *   - .el-rate (Element UI 星级评分组件)
+     *   - .ant-rate (旧版 Ant Design 星级评分组件，兼容)
+     *   - 同时存在评分组件 + 提交按钮时判定为评估页
      * @returns {boolean}
      */
     isEvaluationPage() {
-      return !!document.querySelector('.course-evaluate');
+      // 主检测：Element UI 的 el-rate 或 Ant Design 的 ant-rate
+      const hasRate = !!document.querySelector('.el-rate, .ant-rate');
+      // 补充：检测提交按钮（避免误判课程评分展示页）
+      const hasSubmitBtn = !!document.querySelector('.ant-btn-primary');
+      // 检测文本域（评估通常有论述题）
+      const hasTextarea = !!document.querySelector('textarea');
+      
+      return hasRate && (hasSubmitBtn || hasTextarea);
     },
 
     /**
@@ -105,12 +118,16 @@
 
     /**
      * 步骤1：星级评分 — 打 5 颗星
+     * 
+     * 兼容两种 UI 框架：
+     *   - Element UI: .el-rate > .el-rate__item > .el-rate__icon
+     *   - Ant Design: .ant-rate > .ant-rate-star > [role="radio"]
      */
     async fillStarRating() {
       this.log('⭐ Step 1: Filling star rating...');
 
-      // 尝试多种选择器寻找评分容器
-      const rateGroup = document.querySelector('.ant-rate[role="radiogroup"]') || 
+      // 尝试多种选择器寻找评分容器（Element UI 优先，Ant Design 备选）
+      const rateGroup = document.querySelector('.el-rate') ||
                         document.querySelector('.ant-rate') ||
                         document.querySelector('[class*="rate"]');
 
@@ -119,8 +136,11 @@
         return false;
       }
 
-      // 寻找星星元素
-      const stars = rateGroup.querySelectorAll('.ant-rate-star, [class*="star"]');
+      this.log(`  Detected: ${rateGroup.className.substring(0, 30)}`);
+
+      // Element UI 星星结构: .el-rate__item
+      // Ant Design 星星结构: .ant-rate-star
+      const stars = rateGroup.querySelectorAll('.el-rate__item, .ant-rate-star, [class*="rate__item"], [class*="rate-star"]');
       if (stars.length === 0) {
         this.log('⚠️ No star elements found, skipping.');
         return false;
@@ -129,13 +149,15 @@
       const targetIndex = Math.min(EVAL_CONFIG.starRating - 1, stars.length - 1);
       const targetStar = stars[targetIndex];
       
-      // 找到可点击的元素（Ant Design Rate 结构通常是第一级或内部的 radio/div）
-      const clickableEl = targetStar.querySelector('[role="radio"]') || 
+      // Element UI: 点击 .el-rate__icon
+      // Ant Design: 点击 [role="radio"] 或 .ant-rate-star-first
+      const clickableEl = targetStar.querySelector('.el-rate__icon') ||
+                          targetStar.querySelector('[role="radio"]') ||
                           targetStar.querySelector('.ant-rate-star-first') ||
                           targetStar;
       
       this._click(clickableEl);
-      this.log(`⭐ Rated ${EVAL_CONFIG.starRating} stars (clicked star #${targetIndex + 1})`);
+      this.log(`⭐ Rated ${EVAL_CONFIG.starRating} stars (clicked star #${targetIndex + 1} / ${stars.length})`);
 
       await this.sleep(EVAL_CONFIG.stepDelay);
       return true;
@@ -143,6 +165,8 @@
 
     /**
      * 步骤2：单选题 — 所有题目都选指定选项（默认 D）
+     * 
+     * 兼容 Element UI (.el-radio) 和 Ant Design (.ant-radio-wrapper)
      */
     async fillMultipleChoice() {
       this.log(`📝 Step 2: Filling multiple choice (select option "${EVAL_CONFIG.choiceOption.toUpperCase()}")...`);
@@ -150,7 +174,8 @@
       // 寻找题目容器，尝试多种可能的类名
       const questionItems = document.querySelectorAll('.course-test-type-list-item') || 
                             document.querySelectorAll('.course-test-item') ||
-                            document.querySelectorAll('[class*="test-type-list-item"]');
+                            document.querySelectorAll('[class*="test-type-list-item"]') ||
+                            document.querySelectorAll('[class*="question-item"]');
 
       if (questionItems.length === 0) {
         this.log('⚠️ No question items found, skipping multiple choice.');
@@ -168,10 +193,11 @@
           continue;
         }
 
-        // 寻找选项容器
-        const options = item.querySelectorAll('.ant-radio-wrapper, .ant-checkbox-wrapper, [class*="radio-wrapper"]');
+        // 寻找选项容器（Element UI: .el-radio, Ant Design: .ant-radio-wrapper）
+        const options = item.querySelectorAll('.el-radio, .ant-radio-wrapper, .ant-checkbox-wrapper, [class*="radio-wrapper"], [class*="radio"]');
         if (options.length === 0) {
-          this.log(`  ⚠️ Q${i + 1}: No options found.`);
+          // 如果 item 本身没有选项，可能在全局范围内
+          this.log(`  ⚠️ Q${i + 1}: No options found in item container.`);
           continue;
         }
 
@@ -179,35 +205,36 @@
         let targetOption = null;
         const targetText = EVAL_CONFIG.choiceOption.toUpperCase();
 
-        // 1. 根据 label 属性查找 (AntD 常用)
-        targetOption = item.querySelector(`.ant-radio-wrapper[label="${EVAL_CONFIG.choiceOption}"], .ant-radio-wrapper[label="${targetText}"]`);
+        // 1. 根据文本内容查找 (A/B/C/D)
+        targetOption = Array.from(options).find(opt => {
+          const text = opt.textContent.trim().toUpperCase();
+          return text === targetText || text.startsWith(targetText + '.') || text.startsWith(targetText + ' ') || text.startsWith(targetText + '、');
+        });
 
-        // 2. 根据文本内容查找 (A/B/C/D)
+        // 2. 根据 label 属性查找 (AntD)
         if (!targetOption) {
-          targetOption = Array.from(options).find(opt => {
-            const text = opt.textContent.trim().toUpperCase();
-            return text === targetText || text.startsWith(targetText + '.') || text.startsWith(targetText + ' ') || text.startsWith(targetText + '、');
-          });
+          targetOption = item.querySelector(`.ant-radio-wrapper[label="${EVAL_CONFIG.choiceOption}"], .ant-radio-wrapper[label="${targetText}"]`);
         }
 
-        // 3. 根据索引 Fallback (D 通常是第 4 个)
+        // 3. 根据索引 Fallback (D 是第 4 个)
         if (!targetOption && EVAL_CONFIG.choiceOption === 'd' && options.length >= 4) {
           targetOption = options[3];
           this.log(`  - Q${i + 1}: Option D not found by text/label, using 4th index fallback.`);
         } else if (!targetOption && options.length > 0) {
-          // 如果还是没找到，默认选最后一个
           targetOption = options[options.length - 1];
           this.log(`  - Q${i + 1}: Target option not found, using last option fallback.`);
         }
 
         if (targetOption) {
-          this._click(targetOption);
+          // Element UI radio: 需要点击 .el-radio__input 或 label
+          const elRadioInput = targetOption.querySelector('.el-radio__input, .el-radio__original');
+          const clickTarget = elRadioInput || targetOption;
+          this._click(clickTarget);
           filledCount++;
           
-          // 获取题目文本（用于日志）
           const titleEl = item.querySelector('.course-test-type-list-item-title-content') || item.querySelector('[class*="title"]');
           const titleText = titleEl ? titleEl.textContent.trim().substring(0, 30) : `Question #${i + 1}`;
-          this.log(`  ✓ Q${i + 1}: [${titleText}...] → Selected`);
+          this.log(`  ✓ Q${i + 1}: [${titleText}...] → Selected (via ${targetOption.className.substring(0, 30)})`);
         }
 
         await this.sleep(EVAL_CONFIG.stepDelay);
@@ -223,8 +250,8 @@
     async fillEssayQuestion() {
       this.log(`📝 Step 3: Filling essay question...`);
 
-      // 查找所有可能的文本输入框
-      const textareas = document.querySelectorAll('textarea.ant-input, .course-test-type-list-item textarea, .course-evaluate textarea');
+      // 查找所有可能的文本输入框（兼容 Element UI 和 Ant Design）
+      const textareas = document.querySelectorAll('textarea.ant-input, .course-test-type-list-item textarea, .course-evaluate textarea, .el-textarea__inner, textarea');
       
       if (textareas.length === 0) {
         this.log('⚠️ No essay textarea found, skipping.');
@@ -259,10 +286,12 @@
       // 先等待一小段时间确保所有填写操作完成
       await this.sleep(EVAL_CONFIG.preSubmitDelay);
 
-      // 查找提交按钮 — 尝试多种可能的类名和文字
+      // 查找提交按钮 — 兼容 Element UI (.el-button) 和 Ant Design (.ant-btn)
       let btn = document.querySelector('.course-evaluate-footer .ant-btn-primary') ||
                 document.querySelector('.course-evaluate .ant-btn-primary') ||
-                document.querySelector('button.ant-btn-primary');
+                document.querySelector('button.ant-btn-primary') ||
+                document.querySelector('button.el-button--primary') ||
+                document.querySelector('.el-button--primary');
       
       // Fallback: 查找任何包含"提交"或"确定"文字的按钮
       if (!btn) {

@@ -189,7 +189,13 @@ module.exports = {
 async function isEvaluationPage(page) {
   for (const frame of page.frames()) {
     try {
-      const onEvalPage = await frame.evaluate(() => !!document.querySelector('.course-evaluate'));
+      // 2026-07-03 修复：21tb 评估页不再有 .course-evaluate，改为检测 el-rate + 提交按钮
+      const onEvalPage = await frame.evaluate(() => {
+        const hasRate = !!document.querySelector('.el-rate, .ant-rate');
+        const hasSubmit = !!document.querySelector('.ant-btn-primary, .el-button--primary');
+        const hasTextarea = !!document.querySelector('textarea');
+        return hasRate && (hasSubmit || hasTextarea);
+      });
       if (onEvalPage) return true;
     } catch (e) {
       // 忽略跨域 frame 报错
@@ -224,7 +230,11 @@ async function runEvaluationAuto(page, options = {}) {
   let targetFrame = null;
   for (const frame of page.frames()) {
     try {
-      const onEvalPage = await frame.evaluate(() => !!document.querySelector('.course-evaluate'));
+      const onEvalPage = await frame.evaluate(() => {
+        const hasRate = !!document.querySelector('.el-rate, .ant-rate');
+        const hasSubmit = !!document.querySelector('.ant-btn-primary, .el-button--primary');
+        return hasRate && hasSubmit;
+      });
       if (onEvalPage) {
         targetFrame = frame;
         break;
@@ -233,7 +243,7 @@ async function runEvaluationAuto(page, options = {}) {
   }
 
   if (!targetFrame) {
-    return { success: false, error: 'Evaluation container (.course-evaluate) not found in any frame' };
+    return { success: false, error: 'Evaluation components (.el-rate or .ant-rate + submit button) not found in any frame' };
   }
 
   // 确保 eval-auto 模块已在该 frame 注入

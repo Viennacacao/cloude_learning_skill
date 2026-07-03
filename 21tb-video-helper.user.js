@@ -1025,7 +1025,8 @@
   function findEvaluationContext() {
     const docs = getAccessibleDocuments();
     for (const { doc, source } of docs) {
-      if (doc.querySelector('.course-evaluate, .course-evaluate-title')) {
+      // 2026-07-03: 21tb 迁移到 Element UI，检测 el-rate 而非 course-evaluate
+      if (doc.querySelector('.el-rate, .ant-rate, .course-evaluate, .course-evaluate-title')) {
         return { found: true, doc, source };
       }
     }
@@ -1994,9 +1995,12 @@
         await sleep(500);
       }
     }
-    const submitBtn = evalDoc.querySelector('.course-evaluate button.ant-btn-primary:not(.course-header-btn)');
+    // 2026-07-03: 提交按钮可能不在 .course-evaluate 内，尝试多种选择器
+    const submitBtn = evalDoc.querySelector('.course-evaluate button.ant-btn-primary:not(.course-header-btn)') ||
+                      evalDoc.querySelector('button.ant-btn-primary') ||
+                      evalDoc.querySelector('button.el-button--primary');
     if (submitBtn) {
-      const buttons = evalDoc.querySelectorAll('.course-evaluate button.ant-btn-primary');
+      const buttons = evalDoc.querySelectorAll('.course-evaluate button.ant-btn-primary, button.ant-btn-primary, button.el-button--primary');
       let targetBtn = null;
       buttons.forEach(btn => {
         const text = btn.textContent.trim();

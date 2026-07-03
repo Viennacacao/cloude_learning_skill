@@ -18,7 +18,7 @@
  * 依赖：npm install puppeteer
  */
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
 // 自动加载项目根目录 .env（便于“下载即用”，避免用户手动 export 环境变量）
@@ -83,7 +83,11 @@ function parseArgs() {
     autoEval: true,       // 默认开启评估自动完成
     agent: false,         // 面向 Agent 的对话式模式（单页串行、可退出）
     userDataDir: '',      // 复用 Chrome profile（提升稳定性/避免重复登录）
-    chromePath: '',       // 指定 Chrome 可执行文件路径（优先级高于默认）
+    chromePath: process.platform === 'darwin'
+      ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+      : (process.platform === 'win32'
+        ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+        : '/usr/bin/google-chrome'), // 默认使用系统 Chrome
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -1228,6 +1232,7 @@ async function waitForCourseCompletion(page, course, options = {}) {
   let emittedPostTestConfirm = false;
   let emittedPostTestComplete = false;
   let postTestConfirmRequestWritten = false;
+  let stepsEvalClicked = false;  // 2026-07-03: 防止重复点击 Steps 导航
 
   const requireConfirm =
     String(process.env.POSTTEST_REQUIRE_CONFIRM || '').toLowerCase() === 'true';
@@ -1348,6 +1353,40 @@ async function waitForCourseCompletion(page, course, options = {}) {
 
   for (let i = 0; i < maxPolls; i++) {
     const state = await getEmbeddedPlayerState(page).catch(() => null);
+
+    // 2026-07-03: 新版 21tb 使用 Steps 导航，视频完成后不会自动跳转评估页。
+    // 需要手动点击 "Course Evaluation" 步骤。
+    if (!stepsEvalClicked) {
+      const hasSteps = await page.evaluate(() => !!document.querySelector('.steps')).catch(() => false);
+      if (hasSteps) {
+        const clicked = await page.evaluate(() => {
+          const steps = document.querySelectorAll('.steps-item');
+          for (const step of steps) {
+            const label = step.querySelector('.steps-item-label');
+            if (!label) continue;
+            const text = (label.textContent || '').trim().toLowerCase();
+            if ((text.includes('evaluation') || text.includes('评估')) && label.classList.contains('is-canenter')) {
+              label.click();
+              return { clicked: true, label: label.textContent.trim() };
+            }
+          }
+          // Fallback: 点击第一个 is-canenter 的非当前步骤
+          const fallback = document.querySelector('.steps-item:not(.is-learning) .steps-item-label.is-canenter');
+          if (fallback) {
+            fallback.click();
+            return { clicked: true, label: fallback.textContent.trim(), fallback: true };
+          }
+          return { clicked: false };
+        }).catch(() => ({ clicked: false }));
+
+        stepsEvalClicked = true;
+        if (clicked.clicked) {
+          log(`🖱️ 点击 Steps 导航: "${clicked.label}"${clicked.fallback ? ' (fallback)' : ''}`, 'info');
+          await sleep(4000);
+          continue; // 跳过本轮检测，等页面跳转到评估页
+        }
+      }
+    }
 
     // 评估页兜底（不作为完成条件）
     if (autoEval) {
@@ -1668,6 +1707,7 @@ async function main() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
+      '--disable-crashpad',
     ],
   });
 
