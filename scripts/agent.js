@@ -34,7 +34,6 @@ const path = require('path');
 
 const SKILL_ROOT = path.join(__dirname, '..');
 const LOGS_DIR = path.join(SKILL_ROOT, 'runtime-logs');
-const SESSION_FILE = path.join(LOGS_DIR, 'session.json');
 const SCREENSHOT_DIR = path.join(LOGS_DIR, 'screenshots');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -68,17 +67,6 @@ function loadEnv() {
     const val = raw.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
     if (!process.env[key]) process.env[key] = val;
   }
-}
-
-function saveSession(data) {
-  ensureDirs();
-  fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-function loadSession() {
-  if (!fs.existsSync(SESSION_FILE)) return null;
-  try { return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')); }
-  catch { return null; }
 }
 
 // ============================================================
@@ -231,22 +219,9 @@ async function login() {
   }
 
   log('✅ 登录成功', 'success');
-  saveSession({ loggedIn: true, enterprise, user, loginAt: new Date().toISOString() });
   emit('login_success', { enterprise, user });
 
-  // 不关闭浏览器，保持会话
-  // 但因为是新进程，需要将 browser 存储为持久化
-  // 实际上 Puppeteer browser 对象不能跨进程传递
-  // 所以我们需要用 "connect" 模式或者每次重新启动
-
-  // 方案：记录 wsEndpoint 用于后续连接
-  const wsEndpoint = browser.wsEndpoint();
-  saveSession({ loggedIn: true, enterprise, user, wsEndpoint, loginAt: new Date().toISOString() });
-  emit('session_saved', { wsEndpoint });
-
-  // 保持浏览器打开，不关闭
-  // 进程退出后浏览器也会关闭，所以我们需要一个守护进程
-  // 简化方案：每个命令都重新启动浏览器并复用 userDataDir
+  // 简化：每个命令都重新启动浏览器并复用 userDataDir（session cookie 由 Chrome profile 持久化）
   await browser.close();
   emit('done', { message: 'Login complete. Browser session saved in chrome-profile.' });
 }
@@ -301,13 +276,6 @@ async function getCourses() {
     return result;
   });
 
-  // 保存课表
-  const courseData = {
-    updateTime: new Date().toISOString(),
-    courses,
-  };
-  fs.writeFileSync(path.join(SKILL_ROOT, 'course-data.json'), JSON.stringify(courseData, null, 2), 'utf-8');
-
   log(`✅ 抓取到 ${courses.length} 门课程`, 'success');
   emit('courses_fetched', { total: courses.length, courses });
 
@@ -317,524 +285,6 @@ async function getCourses() {
 // ============================================================
 // 3. 打开课程
 // ============================================================
-
-async function openCourse(courseId) {
-  if (!courseId) {
-    emit('error', { message: 'Usage: open <courseId>' });
-    process.exit(1);
-  }
-
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  const url = `https://v4.21tb.com/courseSetting/courseLearning/play?courseType=NEW_COURSE_CENTER&courseId=${courseId}`;
-  log(`打开课程: ${url}`);
-  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-  await sleep(5000);
-
-  const state = await getPageState(page);
-  log(`页面状态: ${JSON.stringify(state)}`, 'info');
-  emit('course_opened', { courseId, url, state });
-
-  // 不关闭浏览器——但因为是新进程，我们截个图保存状态
-  await page.screenshot({ path: path.join(SCREENSHOT_DIR, `course-open-${Date.now()}.png`) });
-
-  await browser.close();
-  emit('done', { message: 'Course opened. Check screenshot.' });
-}
-
-// ============================================================
-// 4. 播放视频并等待结束
-// ============================================================
-
-async function playVideo(rate = 16) {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  // 获取当前页面 URL——如果不在课程页，报错
-  const url = page.url();
-  if (!url.includes('courseSetting/courseLearning/play')) {
-    emit('error', { message: 'Not on a course page. Open a course first.', url });
-    await browser.close();
-    process.exit(1);
-  }
-
-  log('检测视频元素...');
-  const videoInfo = await page.evaluate(() => {
-    const video = document.querySelector('video');
-    if (!video) return { found: false };
-    return {
-      found: true,
-      paused: video.paused,
-      ended: video.ended,
-      currentTime: video.currentTime,
-      duration: video.duration,
-      readyState: video.readyState,
-    };
-  });
-
-  if (!videoInfo.found) {
-    log('未找到视频元素——可能课程无视频或页面未加载完', 'warn');
-    emit('no_video', { url });
-    await browser.close();
-    return;
-  }
-
-  log(`视频状态: 时长=${videoInfo.duration}s, 当前=${videoInfo.currentTime}s, 暂停=${videoInfo.paused}`);
-
-  // 设置倍速并播放
-  log(`设置 ${rate}x 倍速并播放...`);
-  await page.evaluate((r) => {
-    const video = document.querySelector('video');
-    if (video) {
-      video.playbackRate = r;
-      video.muted = true;
-      video.play().catch(() => {});
-    }
-  }, rate);
-
-  emit('playback_started', { rate, duration: videoInfo.duration });
-
-  // 轮询等待视频结束
-  const pollInterval = 5000; // 5秒
-  const maxWait = (videoInfo.duration || 3600) * 1000 / rate + 60000; // 预估时间 + 60s 余量
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < maxWait) {
-    await sleep(pollInterval);
-
-    const state = await page.evaluate(() => {
-      const video = document.querySelector('video');
-      if (!video) return { found: false };
-      return {
-        found: true,
-        paused: video.paused,
-        ended: video.ended,
-        currentTime: video.currentTime,
-        duration: video.duration,
-      };
-    });
-
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    const progress = state.duration > 0 ? Math.round((state.currentTime / state.duration) * 100) : 0;
-    log(`[${elapsed}s] 进度: ${progress}% (${Math.round(state.currentTime)}/${Math.round(state.duration)}s)`);
-
-    emit('playback_progress', { progress, currentTime: state.currentTime, duration: state.duration });
-
-    if (state.ended) {
-      log('✅ 视频播放结束', 'success');
-      emit('video_ended', { duration: state.duration });
-      break;
-    }
-
-    if (!state.found) {
-      log('视频元素消失——可能页面已跳转', 'warn');
-      emit('video_lost', {});
-      break;
-    }
-
-    // 如果视频暂停了（可能被平台暂停），重新播放
-    if (state.paused && !state.ended && state.currentTime > 0) {
-      log('视频被暂停，重新播放...', 'warn');
-      await page.evaluate(() => {
-        const v = document.querySelector('video');
-        if (v) { v.playbackRate = 16; v.play().catch(() => {}); }
-      });
-    }
-  }
-
-  // 等待 3 秒让页面稳定
-  log('等待 3 秒让页面稳定...');
-  await sleep(3000);
-
-  // 截图
-  await page.screenshot({ path: path.join(SCREENSHOT_DIR, `after-play-${Date.now()}.png`) });
-
-  // 检查页面状态——视频结束后应该能看到 Steps 导航
-  const postState = await getPageState(page);
-  log(`视频结束后页面状态: ${JSON.stringify(postState)}`, 'info');
-  emit('post_play_state', postState);
-
-  await browser.close();
-  emit('done', { message: 'Video playback complete.' });
-}
-
-// ============================================================
-// 5. Steps 导航
-// ============================================================
-
-async function listSteps() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  const steps = await page.evaluate(() => {
-    const result = [];
-    document.querySelectorAll('.steps-item, .el-steps__item, [class*="step-item"]').forEach((el, i) => {
-      const text = el.textContent.trim().replace(/\s+/g, ' ');
-      const isActive = el.classList.contains('is-active') || el.classList.contains('is-learning') || el.classList.contains('is-process');
-      const canEnter = el.classList.contains('is-canenter') || !!el.querySelector('.is-canenter');
-      result.push({ index: i, text, isActive, canEnter });
-    });
-    return result;
-  });
-
-  log(`找到 ${steps.length} 个步骤: ${steps.map(s => s.text).join(', ')}`);
-  emit('steps', { steps });
-  await browser.close();
-}
-
-async function gotoEval() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  log('查找"课程评估"步骤...');
-  const clicked = await page.evaluate(() => {
-    const steps = document.querySelectorAll('.steps-item, .el-steps__item, [class*="step-item"]');
-    for (const step of steps) {
-      const text = step.textContent.trim();
-      if (text.includes('课程评估') || text.includes('Course Evaluation') || text.includes('评估')) {
-        // 找到可点击的子元素
-        const clickable = step.querySelector('.is-canenter, .steps-item-label, [class*="label"]') || step;
-        clickable.click();
-        return { clicked: true, text };
-      }
-    }
-    return { clicked: false };
-  });
-
-  if (clicked.clicked) {
-    log(`✅ 点击了"${clicked.text}"步骤`, 'success');
-    await sleep(3000);
-    const state = await getPageState(page);
-    emit('step_clicked', { text: clicked.text, state });
-  } else {
-    log('未找到"课程评估"步骤', 'warn');
-    emit('no_eval_step', {});
-  }
-
-  await browser.close();
-  emit('done', {});
-}
-
-// ============================================================
-// 6. 填写评估
-// ============================================================
-
-async function fillEval() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  // 确认在评估页
-  const onEval = await page.evaluate(() => {
-    const hasRate = !!document.querySelector('.el-rate, .ant-rate');
-    const hasTextarea = !!document.querySelector('textarea');
-    const hasVideo = !!document.querySelector('video');
-    // 必须有星级评分 + 文本框，且没有正在播放的视频
-    return hasRate && hasTextarea && !hasVideo;
-  });
-
-  if (!onEval) {
-    log('当前不在评估页面', 'warn');
-    emit('not_on_eval', {});
-    await browser.close();
-    return;
-  }
-
-  log('在评估页面，开始填写...', 'success');
-
-  // 1. 星级评分——5星
-  log('填写星级评分 (5星)...');
-  await page.evaluate(() => {
-    const rateEl = document.querySelector('.el-rate, .ant-rate');
-    if (rateEl) {
-      const stars = rateEl.querySelectorAll('.el-rate__item, .ant-rate-star, [class*="rate__item"], [class*="rate-star"]');
-      if (stars.length >= 5) {
-        const target = stars[4]; // 第5颗星
-        const clickable = target.querySelector('.el-rate__icon, [role="radio"], .ant-rate-star-first') || target;
-        clickable.click();
-      }
-    }
-  });
-  await sleep(500);
-
-  // 2. 单选题——全部选 D
-  log('填写单选题 (选D)...');
-  const mcResult = await page.evaluate(() => {
-    const items = document.querySelectorAll('.course-test-type-list-item, [class*="test-type-list-item"], [class*="question-item"]');
-    let filled = 0;
-    items.forEach(item => {
-      if (item.querySelector('textarea') || item.textContent.includes('简答') || item.textContent.includes('论述')) return;
-
-      const options = item.querySelectorAll('.el-radio, .ant-radio-wrapper, .ant-checkbox-wrapper, [class*="radio-wrapper"]');
-      if (options.length === 0) return;
-
-      // 优先按文字找 D
-      let target = Array.from(options).find(o => {
-        const t = o.textContent.trim().toUpperCase();
-        return t === 'D' || t.startsWith('D.') || t.startsWith('D ') || t.startsWith('D、');
-      });
-      // 兜底：第4个选项
-      if (!target && options.length >= 4) target = options[3];
-      // 最终兜底：最后一个
-      if (!target) target = options[options.length - 1];
-
-      if (target) {
-        const input = target.querySelector('.el-radio__input, .el-radio__original, input') || target;
-        input.click();
-        filled++;
-      }
-    });
-    return { filled };
-  });
-  log(`单选题完成: ${mcResult.filled} 道`);
-  await sleep(500);
-
-  // 3. 问答题——固定答案
-  log('填写问答题...');
-  const essayResult = await page.evaluate(() => {
-    const textareas = document.querySelectorAll('textarea');
-    let filled = 0;
-    textareas.forEach(ta => {
-      if (ta.offsetParent === null) return;
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(ta, '很不错，高效');
-      ta.dispatchEvent(new Event('input', { bubbles: true }));
-      ta.dispatchEvent(new Event('change', { bubbles: true }));
-      filled++;
-    });
-    return { filled };
-  });
-  log(`问答题完成: ${essayResult.filled} 道`);
-  await sleep(500);
-
-  // 4. 提交——排除"关闭/取消"按钮
-  log('查找提交按钮...');
-  const submitResult = await page.evaluate(() => {
-    const closeTexts = ['关 闭', '关闭', '取消', '取 消', '返回', '返 回', '报名', '注册', '我要', '退出', '登录', '重置'];
-    const allBtns = Array.from(document.querySelectorAll('button, .el-button, .ant-btn'));
-
-    // 优先：文字包含"提交"或"提交评估"，且不包含关闭类文字
-    let target = allBtns.find(b => {
-      const t = b.textContent.trim();
-      return (t.includes('提交') || t.includes('提 交')) && !closeTexts.some(c => t.includes(c));
-    });
-    // 次选：文字为"确定"
-    if (!target) {
-      target = allBtns.find(b => {
-        const t = b.textContent.trim();
-        return (t === '确定' || t === '确 定') && !closeTexts.some(c => t.includes(c));
-      });
-    }
-    // 不再有 primary 按钮兜底——太容易误点
-
-    if (target) {
-      target.click();
-      return { clicked: true, text: target.textContent.trim() };
-    }
-    return { clicked: false };
-  });
-
-  if (submitResult.clicked) {
-    log(`✅ 提交按钮点击成功: "${submitResult.text}"`, 'success');
-    await sleep(2000);
-
-    // 5. 处理提交后弹窗
-    log('处理提交后弹窗...');
-    await page.evaluate(() => {
-      // 按 Escape
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
-    });
-    await sleep(500);
-
-    // 点击遮罩层
-    await page.evaluate(() => {
-      const masks = document.querySelectorAll('.el-overlay, .v-modal, .ant-modal-mask, .el-dialog__wrapper');
-      masks.forEach(m => m.click());
-      // 点击"确定/知道了"按钮
-      const btns = document.querySelectorAll('button, .el-button, .ant-btn');
-      btns.forEach(b => {
-        const t = b.textContent.trim();
-        if (/^(确定|确 定|知道了|OK|关 闭|关闭|确认)$/.test(t)) b.click();
-      });
-    });
-    await sleep(1000);
-
-    emit('eval_submitted', { submitText: submitResult.text, mc: mcResult.filled, essay: essayResult.filled });
-  } else {
-    log('❌ 未找到提交按钮', 'error');
-    emit('eval_submit_failed', {});
-  }
-
-  await browser.close();
-  emit('done', {});
-}
-
-// ============================================================
-// 7. 课后测试
-// ============================================================
-
-async function checkPostTest() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  const state = await page.evaluate(() => {
-    const hasQuestionList = !!document.querySelector('.course-test-type-list-item, [class*="course-test-type-list-item"]');
-    const hasTestWrap = !!document.querySelector('.course-test-wrap, .course-test-content, [class*="course-test"]');
-    const hasVideo = !!document.querySelector('video');
-    const isPlaying = (() => {
-      const v = document.querySelector('video');
-      return v && !v.paused && !v.ended && v.currentTime > 0;
-    })();
-    return { hasQuestionList, hasTestWrap, hasVideo, isPlaying, isPostTest: (hasQuestionList && hasTestWrap) && !isPlaying };
-  });
-
-  log(`课后测试检测: ${JSON.stringify(state)}`);
-  emit('posttest_check', state);
-
-  await browser.close();
-}
-
-async function answerPostTest() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  // 提取题目
-  log('提取课后测试题目...');
-  const questions = await page.evaluate(() => {
-    const result = [];
-    const items = document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"]');
-    items.forEach((item, i) => {
-      const titleEl = item.querySelector('.course-test-type-list-item-title-content, [class*="title"]');
-      const title = titleEl ? titleEl.textContent.trim() : `Question ${i + 1}`;
-      const options = Array.from(item.querySelectorAll('.el-radio, .ant-radio-wrapper, .ant-checkbox-wrapper, [class*="radio-wrapper"], [class*="checkbox-wrapper"]')).map(o => o.textContent.trim());
-      const hasTextarea = !!item.querySelector('textarea');
-      result.push({ index: i, title, options, hasTextarea });
-    });
-    return result;
-  });
-
-  log(`提取到 ${questions.length} 道题`);
-  emit('questions_extracted', { count: questions.length, questions });
-
-  if (questions.length === 0) {
-    log('未提取到题目', 'warn');
-    await browser.close();
-    return;
-  }
-
-  // 答题——全部选 D（兜底）
-  log('答题中（兜底：全部选D）...');
-  for (const q of questions) {
-    if (q.hasTextarea) {
-      // 问答题
-      await page.evaluate((idx) => {
-        const items = document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"]');
-        const item = items[idx];
-        if (item) {
-          const ta = item.querySelector('textarea');
-          if (ta) {
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-            setter.call(ta, '很不错，高效');
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
-      }, q.index);
-    } else {
-      // 选择题——选 D
-      await page.evaluate((idx) => {
-        const items = document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"]');
-        const item = items[idx];
-        if (!item) return;
-        const options = item.querySelectorAll('.el-radio, .ant-radio-wrapper, [class*="radio-wrapper"]');
-        if (options.length === 0) return;
-        let target = Array.from(options).find(o => {
-          const t = o.textContent.trim().toUpperCase();
-          return t === 'D' || t.startsWith('D.') || t.startsWith('D ');
-        });
-        if (!target && options.length >= 4) target = options[3];
-        if (!target) target = options[options.length - 1];
-        if (target) {
-          const input = target.querySelector('.el-radio__input, input') || target;
-          input.click();
-        }
-      }, q.index);
-    }
-    await sleep(300);
-  }
-
-  log('答题完成，提交...');
-  await sleep(1000);
-
-  // 提交
-  const submitted = await page.evaluate(() => {
-    const closeTexts = ['关 闭', '关闭', '取消', '取 消', '返回', '报名', '注册', '我要', '退出', '登录', '重置'];
-    const btns = Array.from(document.querySelectorAll('button, .el-button, .ant-btn'));
-    let target = btns.find(b => {
-      const t = b.textContent.trim();
-      return (t.includes('提交') || t.includes('提 交') || t.includes('确认提交')) && !closeTexts.some(c => t.includes(c));
-    });
-    if (target) { target.click(); return { clicked: true, text: target.textContent.trim() }; }
-    return { clicked: false };
-  });
-
-  if (submitted.clicked) {
-    log(`✅ 课后测试提交成功: "${submitted.text}"`, 'success');
-    emit('posttest_submitted', submitted);
-    await sleep(2000);
-    // 处理弹窗
-    await page.evaluate(() => {
-      const btns = document.querySelectorAll('button, .el-button, .ant-btn');
-      btns.forEach(b => {
-        const t = b.textContent.trim();
-        if (/^(确定|确 定|知道了|OK|关 闭|关闭)$/.test(t)) b.click();
-      });
-    });
-  } else {
-    log('❌ 未找到提交按钮', 'error');
-    emit('posttest_submit_failed', {});
-  }
-
-  await browser.close();
-  emit('done', {});
-}
-
-// ============================================================
-// 8. 验证完成
-// ============================================================
-
-async function verify() {
-  const browser = await launchBrowser(false);
-  const page = await getOrCreatePage(browser);
-  await ensureLoggedIn(page);
-
-  // 导航到课程中心
-  await page.goto('https://v4.21tb.com/els/html/courseCenter/courseCenter.loadStudyTask.do', {
-    waitUntil: 'networkidle2', timeout: 30000
-  });
-  await sleep(5000);
-
-  // 获取课程状态
-  const courses = await page.evaluate(() => {
-    const result = [];
-    document.querySelectorAll('.nc-mycourse-card').forEach(item => {
-      const title = item.querySelector('.course-title, .title, h3, h4')?.textContent?.trim() || '';
-      const progress = item.querySelector('.progress, .progress-text, [class*="progress"]')?.textContent?.trim() || '';
-      const isFinished = progress.includes('已完成') || progress.includes('完成');
-      if (title) result.push({ title, progress, isFinished });
-    });
-    return result;
-  });
-
-  emit('verify_result', { courses });
-  await browser.close();
-}
 
 // ============================================================
 // 页面状态检测
@@ -1477,58 +927,27 @@ async function main() {
     case 'courses':
       await getCourses();
       break;
-    case 'open':
-      await openCourse(args[1]);
-      break;
-    case 'play':
-      await playVideo(parseInt(args[2] || '16'));
-      break;
-    case 'steps':
-      await listSteps();
-      break;
-    case 'goto-eval':
-      await gotoEval();
-      break;
-    case 'fill-eval':
-      await fillEval();
-      break;
-    case 'check-posttest':
-      await checkPostTest();
-      break;
-    case 'answer-posttest':
-      await answerPostTest();
-      break;
-    case 'verify':
-      await verify();
-      break;
     case 'status':
       await status();
       break;
     case 'screenshot':
       await screenshot();
       break;
-    case 'run':
+    case 'run': {
       const rateArg = args.indexOf('--rate');
       const rate = rateArg >= 0 ? parseInt(args[rateArg + 1]) : 16;
       await runAll(args[1], rate);
       break;
+    }
     default:
       console.log(`Usage: node agent.js <command> [args]
 
 Commands:
-  login                 登录
-  courses               获取课表
-  open <courseId>       打开课程
-  play [--rate N]       播放视频并等待结束
-  steps                 列出 Steps 导航
-  goto-eval             跳转到课程评估
-  fill-eval             填写并提交评估
-  check-posttest        检查课后测试
-  answer-posttest       答题并提交
-  verify               验证完成状态
-  status               获取当前页面状态
-  screenshot           截图
-  run <keyword> [--rate N]  一键全自动
+  login                 登录并获取课表
+  courses               仅获取课表
+  status                获取当前页面状态
+  screenshot <path>     截图保存到指定路径
+  run <keyword> [--rate N]  一键全自动完成指定课程
 
 Environment (.env):
   TB_ENTERPRISE_ID, TB_USER, TB_PASS

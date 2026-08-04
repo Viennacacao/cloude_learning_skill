@@ -51,16 +51,10 @@ Agent 可以按需调用单个命令：
 |------|------|------|
 | `login` | 登录 | `login_success` 事件 |
 | `courses` | 获取课表 | `courses_fetched` 事件 + 课表 JSON |
-| `open <id>` | 打开课程 | `course_opened` 事件 + 页面状态 |
-| `play [--rate N]` | 播放视频等待结束 | `playback_progress` 事件 + `video_ended` |
-| `steps` | 列出 Steps 导航 | `steps` 事件 |
-| `goto-eval` | 跳转到课程评估步骤 | `step_clicked` 事件 |
-| `fill-eval` | 填写并提交评估 | `eval_submitted` 事件 |
-| `check-posttest` | 检查课后测试 | `posttest_check` 事件 |
-| `answer-posttest` | 答题并提交 | `posttest_submitted` 事件 |
-| `verify` | 验证完成状态 | `verify_result` 事件 |
-| `status` | 获取当前页面状态 | `status` 事件 |
-| `screenshot` | 截图 | 截图路径 |
+| `status` | 获取当前页面状态（截图） | `status` 事件 |
+| `screenshot <path>` | 截图保存到指定路径 | 截图路径 |
+
+> 注：内部阶段（播放 / 评估 / 测试）已整合到 `run` 命令中，不单独暴露。
 
 ## Agent 操作指南
 
