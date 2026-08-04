@@ -83,13 +83,26 @@
      * @returns {boolean}
      */
     isEvaluationPage() {
+      // 关键兜底：正在播放视频 → 不是评估页
+      const activeVideo = Array.from(document.querySelectorAll('video')).find(v => {
+        if (v.paused || v.ended || v.readyState < 2) return false;
+        if (v.currentTime <= 0) return false;
+        return true;
+      });
+      if (activeVideo) return false;
+
+      // 兜底：存在视频资源容器 → 不是评估页
+      if (document.querySelector('.chapter-container, .learning-container, .section-list, .catalogue-wrap')) {
+        return false;
+      }
+
       // 主检测：Element UI 的 el-rate 或 Ant Design 的 ant-rate
       const hasRate = !!document.querySelector('.el-rate, .ant-rate');
       // 补充：检测提交按钮（避免误判课程评分展示页）
       const hasSubmitBtn = !!document.querySelector('.ant-btn-primary');
       // 检测文本域（评估通常有论述题）
       const hasTextarea = !!document.querySelector('textarea');
-      
+
       return hasRate && (hasSubmitBtn || hasTextarea);
     },
 
@@ -287,19 +300,34 @@
       await this.sleep(EVAL_CONFIG.preSubmitDelay);
 
       // 查找提交按钮 — 兼容 Element UI (.el-button) 和 Ant Design (.ant-btn)
+      // 优先按文字匹配（排除"关闭/取消"类按钮）
+      const submitTexts = ['提交', '提 交', '确定', '确 定', '提交评估', '保存', '保 存'];
+      const closeTexts = ['关 闭', '关闭', '取消', '取 消', '返回', '返 回'];
+      
       let btn = document.querySelector('.course-evaluate-footer .ant-btn-primary') ||
                 document.querySelector('.course-evaluate .ant-btn-primary') ||
-                document.querySelector('button.ant-btn-primary') ||
-                document.querySelector('button.el-button--primary') ||
-                document.querySelector('.el-button--primary');
+                document.querySelector('.course-evaluate-footer .el-button--primary');
       
-      // Fallback: 查找任何包含"提交"或"确定"文字的按钮
+      if (btn) {
+        const text = btn.textContent.trim();
+        if (closeTexts.some(t => text.includes(t))) btn = null;
+      }
+      
       if (!btn) {
-        const allBtns = Array.from(document.querySelectorAll('button, .ant-btn'));
+        const allBtns = Array.from(document.querySelectorAll('button, .ant-btn, .el-button'));
+        // 首先按文字匹配提交类按钮
         btn = allBtns.find(b => {
           const text = b.textContent.trim();
-          return text === '提交' || text === '提 交' || text === '确定' || text === '确 定' || text === '提交评估';
+          return submitTexts.some(t => text.includes(t)) && !closeTexts.some(t => text.includes(t));
         });
+        // 兜底：选 primary 按钮（排除 close 类）
+        if (!btn) {
+          btn = allBtns.find(b => {
+            const text = b.textContent.trim();
+            const isPrimary = b.classList.contains('el-button--primary') || b.classList.contains('ant-btn-primary');
+            return isPrimary && !closeTexts.some(t => text.includes(t));
+          });
+        }
       }
 
       if (!btn) {
@@ -332,12 +360,15 @@
     async _handlePostSubmitModal() {
       this.log('⏳ Waiting for post-submit modal...');
       
+      let closeAttemptCount = 0;
+      const maxCloseAttempts = 5;
+      
       // 等待弹窗出现（最多 8 秒，因为后端处理可能慢）
       for (let i = 0; i < 16; i++) {
         await this.sleep(500);
 
         // 尝试查找"进入下一步"、"下一节"等按钮（评估提交成功后出现）
-        const nextBtn = Array.from(document.querySelectorAll('button, .ant-btn'))
+        const nextBtn = Array.from(document.querySelectorAll('button, .ant-btn, .el-button'))
           .find(b => {
             const t = b.textContent.trim();
             return t.includes('进入下一步') || t.includes('下一节') || t.includes('继续学习');
@@ -351,16 +382,45 @@
         }
 
         // 尝试查找"确定"/"知道了"/"关闭"等确认按钮
-        const confirmBtn = Array.from(document.querySelectorAll('button, .ant-btn'))
+        const confirmBtn = Array.from(document.querySelectorAll('button, .ant-btn, .el-button'))
           .find(b => /^(确定|知道了|OK|关 闭|关闭|确认)$/.test(b.textContent.trim()));
         
-        if (confirmBtn) {
-          this.log(`✅ Confirm button found: "${confirmBtn.textContent.trim()}"`);
+        if (confirmBtn && closeAttemptCount < maxCloseAttempts) {
+          this.log(`✅ Confirm button found: "${confirmBtn.textContent.trim()}", clicking...`);
           this._click(confirmBtn);
-          await this.sleep(300);
-          // 继续循环，因为点击确认后可能还会出现"进入下一步"
+          closeAttemptCount++;
+          await this.sleep(600);
+          
+          // 点击关闭后，额外尝试点击遮罩层（防止蒙层遮罩阻挡后续操作）
+          const mask = document.querySelector('.el-overlay, .el-dialog__wrapper, .ant-modal-mask, .v-modal');
+          if (mask) {
+            this._click(mask);
+            this.log('  Also clicked modal mask/overlay');
+          }
+          // 持续循环检查
+          continue;
+        }
+
+        // 额外尝试：Element UI dialog header close icon
+        const elCloseBtn = document.querySelector('.el-message-box__close, .el-dialog__close, .el-icon-close');
+        if (elCloseBtn) {
+          this.log(`  Found EL close icon, clicking...`);
+          this._click(elCloseBtn);
+          await this.sleep(500);
+          continue;
         }
       }
+
+      // 循环结束后，强制尝试关闭遮罩和弹窗
+      this.log('  Force-closing any remaining modals...');
+      // Press Escape key
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+      await this.sleep(500);
+      
+      // Click all masks/overlays
+      const masks = document.querySelectorAll('.el-overlay, .v-modal, .ant-modal-mask');
+      masks.forEach(m => this._click(m));
 
       this.log('ℹ️ Post-submit modal handling finished.');
       return false;

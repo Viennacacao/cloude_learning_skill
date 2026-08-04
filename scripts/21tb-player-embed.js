@@ -185,12 +185,25 @@ module.exports = {
 
 /**
  * 检测当前页面或任意 iframe 是否为评估页面
+ * 注意：正在播放视频时绝对不能误判为评估页
  */
 async function isEvaluationPage(page) {
   for (const frame of page.frames()) {
     try {
-      // 2026-07-03 修复：21tb 评估页不再有 .course-evaluate，改为检测 el-rate + 提交按钮
       const onEvalPage = await frame.evaluate(() => {
+        // 关键兜底：检测到正在播放的视频（currentTime > 0 且未 paused）→ 不是评估页
+        const activeVideo = Array.from(document.querySelectorAll('video')).find(v => {
+          if (v.paused || v.ended || v.readyState < 2) return false;
+          if (v.currentTime <= 0) return false;
+          return true;
+        });
+        if (activeVideo) return false;
+
+        // 兜底：存在视频资源容器（章节列表）→ 不是评估页
+        if (document.querySelector('.chapter-container, .learning-container, .section-list, .catalogue-wrap')) {
+          return false;
+        }
+
         const hasRate = !!document.querySelector('.el-rate, .ant-rate');
         const hasSubmit = !!document.querySelector('.ant-btn-primary, .el-button--primary');
         const hasTextarea = !!document.querySelector('textarea');

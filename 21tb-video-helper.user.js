@@ -1005,6 +1005,24 @@
   function findPostTestContext() {
     const docs = getAccessibleDocuments();
     for (const { doc, source } of docs) {
+      // 关键兜底：页面有可见的视频播放器在播放 → 不是测试页
+      const activeVideo = Array.from(doc.querySelectorAll('video')).find(v => {
+        if (v.offsetParent === null && v.style.display !== 'block') return false;
+        if (v.paused || v.ended || v.readyState < 2) return false;
+        if (v.currentTime <= 0) return false;
+        return true;
+      });
+      if (activeVideo) {
+        // 视频正在播放，无论关键词如何匹配，都不是测试页
+        continue;
+      }
+
+      // 关键兜底：存在视频资源容器（章节/课程组件） → 不是测试页
+      if (doc.querySelector('.chapter-container .video-item, .learning-container, .section-list, .catalogue-wrap')) {
+        // 这是课程视频页，即使 body 含"考试"字样也跳过
+        continue;
+      }
+
       const title = (doc.querySelector('.course-test-title, .course-test-head, .course-test-wrap .title, h1, h2, .ant-page-header-heading-title')?.textContent || '').trim();
       const bodyText = (doc.body?.innerText || '').slice(0, 1000).replace(/\s+/g, ' ');
       const hasQuestionList = !!doc.querySelector('.course-test-type-list-item, [class*="course-test-type-list-item"]');
