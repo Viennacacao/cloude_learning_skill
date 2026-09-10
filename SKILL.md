@@ -61,8 +61,14 @@ Agent 可以按需调用单个命令：
 | `status` | 获取当前页面状态 | `status` 事件 |
 | `screenshot` | 截图保存到运行目录 | `screenshot` 事件 + 路径 |
 | `test-ai` | 验证 AI 接口及答案格式 | `ai_test_success` 事件 |
+| `run <关键词>` | 完成单门课程（学习→评估→课后测试） | `all_done` / `incomplete` 事件 |
+| `run-all` | 一次登录串行完成课表里所有未完成课程 | 每门课的 `all_done` 事件 |
+| `dump-test <关键词>` | **只读** dump 课后测试页 DOM + 多选点击试验，不提交 | `dump_test` 事件 |
+| `dry-test <关键词>` | **空跑答题**：AI 作答并写入页面后回读校验，**不提交、零消耗** | `dry_run_result` 事件 |
 
 > 注：内部阶段（播放 / 评估 / 测试）已整合到 `run` 命令中，不单独暴露。
+
+> 补考次数有限。**改动答题逻辑后，务必先用 `dry-test` 在全新试卷上验证通过，再跑 `run`。**
 
 ## Agent 操作指南
 
@@ -86,6 +92,12 @@ Agent 可以按需调用单个命令：
 - **评估提交失败**：运行 `screenshot` 截图查看页面，可能按钮文字不同
 - **课后测试 AI 失败**：立即停止且禁止提交；检查 API Key、接口地址、模型名及 AI 返回格式，不使用固定选项兜底
 - **章节切换失败**：检查 `chapters_detected`、`chapter_switched`、`chapter_switch_confirmed` 和 `chapter_result` 事件定位失败章节
+- **多选题没选上 / 得分只有一半**：先用 `dry-test` 空跑。若 `dry_run_result.mismatched` 非空，
+  说明选项点击没生效——多半是选项元素结构变了，检查 `clickOption` 的选择器是否还匹配
+- **点了没反应、成绩页显示"还有 N 次重测机会"**：这是**已交卷的只读卷**，
+  必须先点「去补考」开新卷。脚本已内置 `startRetestIfNeeded`，若它报
+  `Retest button not found`，说明按钮文案又变了，把新文案加进正则即可
+  （已支持：去补考 / 重测 / 再考 / 重考 / 再测 / 重新测试 / 重新考试）
 
 ## 关键设计决策
 
