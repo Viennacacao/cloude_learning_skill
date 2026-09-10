@@ -1524,15 +1524,77 @@ async function testAiConnection() {
 // ============================================================
 
 // 修复版主流程：接管新标签页、逐章节学习、AI 课后测试、严格完成验证。
+// 完成单门课程（调用方负责浏览器生命周期、登录与课表抓取）
+async function completeOneCourse(browser, courseListPage, course, rate) {
+  emit('phase', { phase: 'open_course', course: course.title });
+  let coursePage = await openCoursePage(browser, courseListPage, course);
+  emit('course_frames_before_hook', { frames: await inspectFrames(coursePage) });
+
+  // 课程页先完整初始化，再安装页面内助手。禁止在这里 reload：
+  // 实跑已证明 SPA 启动前注入会让课程页只剩空壳。
+  await installDocSpeedupHook(coursePage);
+  emit('course_frames_after_hook', { frames: await inspectFrames(coursePage) });
+
+  emit('phase', { phase: 'learn_chapters', course: course.title });
+  const learned = await learnAllChapters(coursePage, rate);
+  if (!learned) throw new Error('Not all chapters were learned');
+
+  const requiresEvaluation = /课程评估|Course Evaluation/i.test(course.fullText || '');
+  emit('phase', { phase: 'goto_eval', course: course.title });
+  const evalStep = await clickCourseStep(coursePage, ['课程评估', 'Course Evaluation']);
+  emit('step_clicked', { step: 'evaluation', ...evalStep });
+  if (evalStep.clicked) {
+    emit('phase', { phase: 'fill_eval', course: course.title });
+    const evaluation = await fillAndSubmitEvaluation(coursePage);
+    emit(evaluation.submitted ? 'eval_submitted' : 'eval_submit_failed', evaluation);
+    if (requiresEvaluation && !evaluation.submitted) {
+      throw new Error(`Required evaluation was not submitted: ${evaluation.reason}`);
+    }
+  } else if (requiresEvaluation) {
+    throw new Error('Required evaluation step is unavailable');
+  }
+
+  // 评估提交后，测试可能自动出现，也可能需要显式点击步骤。
+  emit('phase', { phase: 'posttest', course: course.title });
+  const posttestStep = await clickCourseStep(coursePage, ['课后测试', 'Post-test', 'Post Test']);
+  emit('step_clicked', { step: 'posttest', ...posttestStep });
+  const posttest = await answerPostTestWithAI(coursePage);
+  if (posttest.found && !posttest.submitted) throw new Error(`Post-test was not submitted: ${posttest.reason}`);
+  if (!posttest.found) emit('posttest_skipped', { reason: 'no_questions' });
+
+  emit('phase', { phase: 'verify', course: course.title });
+  let verifiedCourse = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const refreshed = await scrapeCourses(courseListPage);
+    verifiedCourse = refreshed.find(item => item.id === course.id || item.title.includes(course.title));
+    emit('verify_result', { attempt, course: verifiedCourse || null });
+    if (verifiedCourse?.isFinished) break;
+    if (attempt < 3) await sleep(5000);
+  }
+
+  // 课程页是新标签时关掉它回到课表页，避免标签堆积影响后续课程的 openCoursePage
+  if (coursePage !== courseListPage) {
+    await coursePage.close().catch(() => {});
+  }
+  await courseListPage.bringToFront().catch(() => {});
+
+  if (!verifiedCourse?.isFinished) {
+    emit('incomplete', { course: verifiedCourse || course, message: 'Platform did not confirm completion' });
+    return { ok: false, course };
+  }
+  emit('all_done', { course: verifiedCourse });
+  log(`🎉 平台已确认完成：${verifiedCourse.title}`, 'success');
+  return { ok: true, course: verifiedCourse };
+}
+
 async function runAll(keyword, rate = 4) {
   loadEnv();
   if (!keyword) throw new Error('Usage: run <keyword>');
   if (!Number.isFinite(rate) || rate <= 0) throw new Error(`Invalid playback rate: ${rate}`);
 
   const browser = await launchBrowser(false);
-  let courseListPage = null;
   try {
-    courseListPage = await getOrCreatePage(browser);
+    const courseListPage = await getOrCreatePage(browser);
     emit('phase', { phase: 'login' });
     const loggedIn = await ensureLoggedIn(courseListPage);
     if (!loggedIn) throw new Error('Login failed; refusing to continue');
@@ -1552,58 +1614,56 @@ async function runAll(keyword, rate = 4) {
       emit('already_complete', { course });
       return;
     }
+    await completeOneCourse(browser, courseListPage, course, rate);
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
 
-    emit('phase', { phase: 'open_course' });
-    let coursePage = await openCoursePage(browser, courseListPage, course);
-    emit('course_frames_before_hook', { frames: await inspectFrames(coursePage) });
+// 一次登录、一个浏览器进程内，串行完成课表里所有未完成课程。
+// 多轮重试：部分课程（如音频课）一轮跑不完，平台标记有延迟。
+async function runAllCourses(rate = 4, maxRounds = 3) {
+  loadEnv();
+  if (!Number.isFinite(rate) || rate <= 0) throw new Error(`Invalid playback rate: ${rate}`);
 
-    // 课程页先完整初始化，再安装当前文档 Hook。切换/重选章节会创建新的倒计时并使用 Hook。
-    // 禁止在这里 reload：实跑已证明 Hook 在 SPA 启动前生效会让课程页只剩空壳。
-    await installDocSpeedupHook(coursePage);
-    emit('course_frames_after_hook', { frames: await inspectFrames(coursePage) });
+  const COURSE_CENTER = 'https://v4.21tb.com/els/html/index.parser.do?id=NEW_COURSE_CENTER&current_app_id=8a80810f5ab29060015ad1906d0b3811';
+  const browser = await launchBrowser(false);
+  try {
+    const courseListPage = await getOrCreatePage(browser);
+    emit('phase', { phase: 'login' });
+    const loggedIn = await ensureLoggedIn(courseListPage);
+    if (!loggedIn) throw new Error('Login failed; refusing to continue');
 
-    emit('phase', { phase: 'learn_chapters' });
-    const learned = await learnAllChapters(coursePage, rate);
-    if (!learned) throw new Error('Not all chapters were learned');
+    for (let round = 1; round <= maxRounds; round++) {
+      emit('phase', { phase: 'courses', round });
+      const courses = await scrapeCourses(courseListPage);
+      if (courses.length === 0) throw new Error('Course list is empty');
+      emit('courses_fetched', { round, total: courses.length, courses });
 
-    const requiresEvaluation = /课程评估|Course Evaluation/i.test(course.fullText || '');
-    emit('phase', { phase: 'goto_eval' });
-    const evalStep = await clickCourseStep(coursePage, ['课程评估', 'Course Evaluation']);
-    emit('step_clicked', { step: 'evaluation', ...evalStep });
-    if (evalStep.clicked) {
-      emit('phase', { phase: 'fill_eval' });
-      const evaluation = await fillAndSubmitEvaluation(coursePage);
-      emit(evaluation.submitted ? 'eval_submitted' : 'eval_submit_failed', evaluation);
-      if (requiresEvaluation && !evaluation.submitted) {
-        throw new Error(`Required evaluation was not submitted: ${evaluation.reason}`);
+      const pending = courses.filter(c => !c.isFinished);
+      emit('pending_courses', { round, count: pending.length, titles: pending.map(c => c.title) });
+      if (pending.length === 0) {
+        log('🎉 课表内已无未完成课程', 'success');
+        emit('all_courses_complete', {});
+        return;
       }
-    } else if (requiresEvaluation) {
-      throw new Error('Required evaluation step is unavailable');
-    }
+      log(`第 ${round}/${maxRounds} 轮：${pending.length} 门待完成 → ${pending.map(c => c.title).join(' / ')}`);
 
-    // 评估提交后，测试可能自动出现，也可能需要显式点击步骤。
-    emit('phase', { phase: 'posttest' });
-    const posttestStep = await clickCourseStep(coursePage, ['课后测试', 'Post-test', 'Post Test']);
-    emit('step_clicked', { step: 'posttest', ...posttestStep });
-    const posttest = await answerPostTestWithAI(coursePage);
-    if (posttest.found && !posttest.submitted) throw new Error(`Post-test was not submitted: ${posttest.reason}`);
-    if (!posttest.found) emit('posttest_skipped', { reason: 'no_questions' });
-
-    emit('phase', { phase: 'verify' });
-    let verifiedCourse = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const refreshed = await scrapeCourses(courseListPage);
-      verifiedCourse = refreshed.find(item => item.id === course.id || item.title.includes(course.title));
-      emit('verify_result', { attempt, course: verifiedCourse || null });
-      if (verifiedCourse?.isFinished) break;
-      if (attempt < 3) await sleep(5000);
+      for (const course of pending) {
+        log(`===== 开始：${course.title}（${course.progress}）=====`, 'success');
+        try {
+          const res = await completeOneCourse(browser, courseListPage, course, rate);
+          emit('course_round_result', { round, title: course.title, ok: res.ok });
+        } catch (e) {
+          log(`课程「${course.title}」本轮失败：${e.message}`, 'error');
+          emit('course_round_result', { round, title: course.title, ok: false, error: e.message });
+          // 失败后把课表页拉回可用状态，继续下一门而不是整体中断
+          await courseListPage.goto(COURSE_CENTER, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          await sleep(4000);
+          await dismissExpiredModal(courseListPage).catch(() => {});
+        }
+      }
     }
-    if (!verifiedCourse?.isFinished) {
-      emit('incomplete', { course: verifiedCourse || course, message: 'Platform did not confirm completion' });
-      throw new Error('Platform did not confirm course completion');
-    }
-    emit('all_done', { course: verifiedCourse });
-    log(`🎉 平台已确认完成：${verifiedCourse.title}`, 'success');
   } finally {
     await browser.close().catch(() => {});
   }
@@ -1991,6 +2051,10 @@ async function main() {
     case 'dump-eval':
       await dumpEval(args[1]);
       break;
+    case 'run-all':
+      await runAllCourses(args.indexOf('--rate') >= 0 ? parseInt(args[args.indexOf('--rate') + 1]) : 4,
+        args.indexOf('--rounds') >= 0 ? parseInt(args[args.indexOf('--rounds') + 1]) : 3);
+      break;
     case 'diag-rate':
       await diagRate(args[1], parseInt(args[2] || '30'));
       break;
@@ -2005,7 +2069,8 @@ Commands:
   courses                     仅获取课表
   status                      获取当前页面状态
   screenshot                  截图保存
-  run <keyword> [--rate N]    一键全自动完成指定课程（默认 8x）
+  run <keyword> [--rate N]    一键全自动完成指定课程（默认 4x）
+  run-all [--rate N] [--rounds N]  一次登录串行完成课表里所有未完成课程（推荐）
   diag-rate <关键词> [秒数]   诊断倍速：对比 1x/4x 实际前进量 + 探测 aliplayer API
   dump-eval <keyword>         走完整流程并 dump 评估页 DOM（用于排查评估提交失败）
   test-ai                    验证课后测试 AI 配置与返回格式
