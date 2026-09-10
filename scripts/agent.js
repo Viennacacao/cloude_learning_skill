@@ -698,7 +698,19 @@ async function callAiForQuestions(questions) {
         messages: [
           {
             role: 'system',
-            content: '你是严谨的课程测试答题助手。根据题干和选项作答。只输出 JSON 数组；每项字段为 index、answer、reason。单选/判断题 answer 是一个选项字母，多选题 answer 是字母数组，简答题 answer 是简洁中文答案。不得省略题目。',
+            content: [
+              '你是严谨的课程测试答题助手。只输出 JSON 数组，每项字段为 index、answer、reason，不得省略任何题目。',
+              '题型规则：',
+              '- type=single（单选/判断）：answer 是一个选项字母。',
+              '- type=multiple（多选）：answer 是字母数组。',
+              '- type=essay（简答）：answer 是简洁中文答案。',
+              '多选题作答要求（关键）：',
+              '1. 必须对每个选项独立判断"该说法本身是否正确且符合题意"，再汇总。',
+              '2. 严禁全选、严禁凭感觉凑数；"属于/包括/可以作为"类题目通常有明确边界，错误项常有明显硬伤（如夸大、偷换概念、张冠李戴）。',
+              '3. 排除法优先：先剔除明显错误项，再在剩余项中确认。',
+              '4. 宁可少选确定的，也不要多选没把握的——多选需完全正确才得分。',
+              '5. reason 里简要写出每个选项的取舍理由。',
+            ].join('\n'),
           },
           { role: 'user', content: JSON.stringify({ questions }) },
         ],
@@ -1042,6 +1054,7 @@ async function learnCurrentChapter(page, chapter, rate) {
   // getChapterCatalog 会遍历所有 frame，很重——节流到 12s 一次，
   // 完成判定主要由页面内助手负责，这里只是最终确认。
   let lastCatalogCheckAt = 0;
+  let noObjectTicks = 0;
 
   // 音频/视频章节切换后播放器要几秒才挂载。过早启动助手会让它找不到 audio/video
   // 而退化成推 recordTime —— 平台不认这条路径（章节进度不涨）。先等播放器就绪。
@@ -1159,6 +1172,30 @@ async function learnCurrentChapter(page, chapter, rate) {
       log(`  ↳ ${Math.round(snap.sinceAdvanceMs / 1000)}s 无进展，执行停滞救援：${acts.find(a => a && a !== 'no_media') || 'no_media'}`, 'warn');
     }
 
+    // 兜底：长时间找不到任何学习对象，且页面其实是课后测试/课程评估页
+    // （说明学习早已完成，平台把步骤条直接切走了），不要再空等到 20 分钟超时。
+    if (!snap.mode) {
+      noObjectTicks++;
+      if (noObjectTicks >= 15) {
+        const gate = await page.evaluate(() => {
+          const t = document.body?.innerText || '';
+          return {
+            hasMedia: document.querySelectorAll('video, audio').length > 0,
+            isTest: /课后测试倒计时|这是您第\s*\d+\s*次课后测试|您一共有\s*\d+\s*次考试机会/.test(t),
+            isEval: /课程评估|请完成课程评估|恭喜您已经完成课程学习/.test(t),
+          };
+        }).catch(() => null);
+        if (gate && !gate.hasMedia && (gate.isTest || gate.isEval)) {
+          log(`章节 ${chapter.index + 1} 无学习对象，但平台已切到${gate.isTest ? '课后测试' : '课程评估'}页，按学习完成处理`, 'warn');
+          await helperAll(() => window.__TBH__ && window.__TBH__.stop());
+          return { ok: true, mode: 'none', reason: gate.isTest ? 'already_on_posttest' : 'already_on_evaluation' };
+        }
+        noObjectTicks = 0;
+      }
+    } else {
+      noObjectTicks = 0;
+    }
+
     if (Date.now() - lastLogAt > 6000) {
       lastLogAt = Date.now();
       if (snap.mode === 'video' && snap.video) {
@@ -1177,10 +1214,11 @@ async function learnCurrentChapter(page, chapter, rate) {
 }
 
 async function learnAllChapters(page, rate) {
-  // 平台可能已判定学习阶段完成并直接停在评估页（"恭喜您已经完成课程学习，请完成课程评估"）。
-  // 此时既没有章节目录也没有视频，必须识别出来并跳过，否则会误报 no_learning_gate。
+  // 平台可能已判定学习阶段完成并直接停在评估页（"恭喜您已经完成课程学习，请完成课程评估"）
+  // 或停在课后测试答题页（"课后测试倒计时：44:59"、"这是您第 1 次课后测试"）。
+  // 这两种页面既没有章节目录也没有视频，必须识别出来并跳过，否则会误报 no_learning_gate / 死等学习对象。
   const learningDone = async () => page.evaluate(() =>
-    /恭喜您已经完成课程学习|已完成课程学习|请完成课程评估|课程学习已完成/.test(document.body?.innerText || '')
+    /恭喜您已经完成课程学习|已完成课程学习|请完成课程评估|课程学习已完成|课后测试倒计时|这是您第\s*\d+\s*次课后测试|您一共有\s*\d+\s*次考试机会/.test(document.body?.innerText || '')
   );
   if (await learningDone()) {
     log('平台已判定课程学习完成，跳过章节学习，直接进入评估', 'success');
@@ -1417,16 +1455,11 @@ async function extractPostTestQuestions(page) {
   return { frame: null, questions: [] };
 }
 
-async function answerPostTestWithAI(page) {
-  let context = await extractPostTestQuestions(page);
-  const questions = context.questions;
-  if (questions.length === 0) return { found: false, submitted: false, reason: 'no_questions' };
-  emit('questions_extracted', { count: questions.length, questions });
-  log(`调用 AI 解答 ${questions.length} 道课后测试题...`);
-  const ai = await callAiForQuestions(questions);
+// 把 AI 返回的原始答案规整成可执行的作答计划（校验缺答/非法选项）
+function buildAnswerPlan(questions, aiAnswers) {
   const plan = [];
   for (const question of questions) {
-    const item = ai.answers.find(answer => Number(answer.index) === question.index);
+    const item = aiAnswers.find(answer => Number(answer.index) === question.index);
     if (!item) throw new Error(`AI omitted question ${question.index + 1}`);
     if (question.type === 'essay') {
       const answer = String(item.answer || '').trim();
@@ -1440,6 +1473,209 @@ async function answerPostTestWithAI(page) {
     }
     plan.push({ index: question.index, type: question.type, answer, reason: item.reason || '' });
   }
+  return plan;
+}
+
+// 给题目和选项打上稳定标记，并读出「当前真实选中状态」。
+// 平台用的是 Ant Design Vue：input 是隐藏的，页面内 input.click() 对 checkbox 完全无效
+// （实测点击后 before/after 零变化，导致多选只剩最后一个选项被选中 → 整卷 50 分）。
+async function tagAndReadOptions(frame) {
+  return frame.evaluate(() => {
+    const visible = el => !!el && el.offsetParent !== null;
+    const all = Array.from(document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"], [class*="question-item"]'));
+    const items = all.filter(item => visible(item) && !all.some(o => o !== item && o.contains(item)));
+    return items.map((item, qi) => {
+      item.setAttribute('data-tbh-q', String(qi));
+      const opts = Array.from(item.querySelectorAll('.el-radio, .ant-radio-wrapper, .el-checkbox, .ant-checkbox-wrapper, [class*="radio-wrapper"], [class*="checkbox-wrapper"]'));
+      const seen = new Set();
+      const list = [];
+      let oi = 0;
+      for (const el of opts) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        const key = (text.match(/^([A-Z])[\.、\s]/i)?.[1] || String.fromCharCode(65 + oi)).toUpperCase();
+        oi++;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const input = el.querySelector('input');
+        const checked = input
+          ? !!input.checked
+          : /is-checked|ant-radio-checked|ant-checkbox-checked|\bchecked\b/i.test((el.className || '').toString());
+        el.setAttribute('data-tbh-opt', String(qi));
+        el.setAttribute('data-tbh-key', key);
+        list.push({ key, checked, disabled: input ? !!input.disabled : false });
+      }
+      return list;
+    });
+  });
+}
+
+// 用 Puppeteer 真实鼠标点击选项（会走完整的 pointerdown/mousedown/click 链路，
+// 和真人点击一致，Ant Design 的 handler 一定能收到）。
+async function clickOption(frame, qi, key) {
+  const handle = await frame.$(`[data-tbh-opt="${qi}"][data-tbh-key="${key}"]`).catch(() => null);
+  if (!handle) return 'no_element';
+  const disabled = await handle.evaluate(el => {
+    const input = el.querySelector('input');
+    return input ? !!input.disabled : false;
+  }).catch(() => false);
+  if (disabled) return 'disabled';
+  try {
+    await handle.click();
+    return 'clicked';
+  } catch {
+    // 兜底：元素被遮挡时退化为页面内点击
+    try {
+      await handle.evaluate(el => {
+        const input = el.querySelector('input');
+        if (input) input.click();
+        else el.click();
+      });
+      return 'fallback';
+    } catch {
+      return 'failed';
+    }
+  }
+}
+
+// 把 AI 答案写进页面：真实点击 + 取消误选 + 写后校验（最多 3 轮）
+async function applyAnswerPlan(frame, plan) {
+  const desired = plan.map(item => ({
+    type: item.type,
+    want: Array.isArray(item.answer) ? item.answer : [item.answer],
+  }));
+
+  // 简答题：直接写 textarea（自己定位题目，不依赖尚未生成的 data-tbh-q 标记）
+  await frame.evaluate(planItems => {
+    const visible = el => !!el && el.offsetParent !== null;
+    const all = Array.from(document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"], [class*="question-item"]'));
+    const items = all.filter(item => visible(item) && !all.some(o => o !== item && o.contains(item)));
+    for (const p of planItems) {
+      if (p.type !== 'essay') continue;
+      const textarea = items[p.index]?.querySelector('textarea');
+      if (!textarea) continue;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(textarea, p.answer);
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, plan.map(({ index, type, answer }) => ({ index, type, answer }))).catch(() => {});
+
+  const computeTodo = state => {
+    const todo = [];
+    for (let qi = 0; qi < desired.length; qi++) {
+      const item = desired[qi];
+      if (item.type === 'essay') continue;
+      const cur = state[qi] || [];
+      const want = new Set(item.want.filter(Boolean));
+      for (const opt of cur) {
+        const should = want.has(opt.key);
+        // 单选/判断：只需保证目标被选中（radio 点不掉，也不必点掉）
+        if (item.type !== 'multiple') {
+          if (should && !opt.checked) todo.push({ qi, key: opt.key });
+          continue;
+        }
+        // 多选：既要选上想要的，也要取消上一次残留的错选
+        if (should !== opt.checked) todo.push({ qi, key: opt.key });
+      }
+    }
+    return todo;
+  };
+
+  const rounds = [];
+  let state = await tagAndReadOptions(frame);
+  for (let round = 1; round <= 4; round++) {
+    let todo = computeTodo(state);
+    if (todo.length === 0) {
+      // 刚点完 Vue 可能还没重渲染完，读到的是中间态。再读一次确认，
+      // 否则会误判"全部一致"而漏掉真正没点上的选项（实测漏过 E 选项）
+      await sleep(800);
+      state = await tagAndReadOptions(frame);
+      todo = computeTodo(state);
+      if (todo.length === 0) break;
+    }
+    const results = {};
+    for (const task of todo) {
+      const r = await clickOption(frame, task.qi, task.key);
+      results[r] = (results[r] || 0) + 1;
+      await sleep(150);
+    }
+    rounds.push({ round, todo: todo.length, ...results });
+    await sleep(800);
+    state = await tagAndReadOptions(frame);
+  }
+
+  // 写后校验：逐题比对最终状态与预期
+  const mismatched = [];
+  let ok = 0;
+  for (let qi = 0; qi < desired.length; qi++) {
+    const item = desired[qi];
+    if (item.type === 'essay') { ok++; continue; }
+    const cur = state[qi] || [];
+    const actual = cur.filter(o => o.checked).map(o => o.key).sort();
+    const want = [...new Set(item.want.filter(Boolean))].sort();
+    const same = actual.length === want.length && actual.every((k, i) => k === want[i]);
+    if (same) ok++;
+    else mismatched.push({ index: qi, type: item.type, want, actual });
+  }
+  return { count: ok, total: desired.length, mismatched, rounds, finalState: state };
+}
+
+// 试卷处于"已交卷/成绩回顾"态时（页面出现"测试成绩xx分。还有 N 次重测机会"），
+// 显示的答案是上一份卷子的，点任何选项都不会生效。必须先点「重测」开一份新卷。
+async function startRetestIfNeeded(page) {
+  const state = await page.evaluate(() => {
+    const t = document.body?.innerText || '';
+    if (!/测试成绩|重测机会|重测/.test(t)) return { needed: false };
+    const buttons = Array.from(document.querySelectorAll('button, .el-button, .ant-btn, a, div[role="button"]'))
+      .filter(b => b.offsetParent !== null && !b.disabled);
+    const texts = buttons.map(b => (b.textContent || '').replace(/\s+/g, '').trim()).filter(Boolean);
+    // 平台把重开试卷的按钮叫「补考」（也见过「重测」），两者都要认
+    const target = buttons.find(b => {
+      const txt = (b.textContent || '').replace(/\s+/g, '');
+      return txt.length > 0 && txt.length <= 12 && /补考|重测|再考|重考|再测|重新测试|重新考试/.test(txt);
+    });
+    if (!target) return { needed: true, found: false, buttons: texts.slice(0, 30) };
+    target.click();
+    return { needed: true, found: true, text: (target.textContent || '').trim() };
+  }).catch(() => ({ needed: false }));
+  if (!state.needed || !state.found) return state;
+  // 重测通常有二次确认弹窗
+  await sleep(1500);
+  const confirmed = await page.evaluate(() => {
+    const buttons = Array.from(document.querySelectorAll('button, .el-button, .ant-btn'))
+      .filter(b => b.offsetParent !== null && !b.disabled);
+    const target = buttons.find(b => /^(确定|确认|是|OK)$/.test((b.textContent || '').replace(/\s+/g, '')));
+    if (!target) return false;
+    target.click();
+    return true;
+  }).catch(() => false);
+  await sleep(4000);
+  await dismissExpiredModal(page);
+  return { ...state, confirmed };
+}
+
+async function answerPostTestWithAI(page) {
+  // 已交卷的卷子改不动，先重测开新卷
+  const retake = await startRetestIfNeeded(page);
+  if (retake.needed) {
+    emit('retest_click', retake);
+    log(retake.found
+      ? `检测到成绩回顾态，已点击「${retake.text}」重开试卷${retake.confirmed ? '（含确认）' : ''}`
+      : `检测到成绩回顾态但未找到补考按钮，页面按钮: ${JSON.stringify(retake.buttons || [])}`, retake.found ? 'info' : 'warn');
+    // 找不到补考按钮就别答了：只读卷子点了也没用，白白浪费一次补考机会
+    if (!retake.found) {
+      throw new Error(`Retest button not found; refusing to answer a graded paper. buttons=${JSON.stringify(retake.buttons || [])}`);
+    }
+    await sleep(3000);
+  }
+
+  let context = await extractPostTestQuestions(page);
+  const questions = context.questions;
+  if (questions.length === 0) return { found: false, submitted: false, reason: 'no_questions' };
+  emit('questions_extracted', { count: questions.length, questions });
+  log(`调用 AI 解答 ${questions.length} 道课后测试题...`);
+  const ai = await callAiForQuestions(questions);
+  const plan = buildAnswerPlan(questions, ai.answers);
 
   // AI 调用期间页面可能重新渲染 iframe。提交前重新定位题目，并确保仍是同一份试卷。
   const refreshedContext = await extractPostTestQuestions(page);
@@ -1449,47 +1685,11 @@ async function answerPostTestWithAI(page) {
   }
   context = refreshedContext;
 
-  const applied = await context.frame.evaluate(planItems => {
-    const all = Array.from(document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"], [class*="question-item"]'));
-    const items = all.filter(item => item.offsetParent !== null && !all.some(other => other !== item && other.contains(item)));
-    let count = 0;
-    for (const plan of planItems) {
-      const item = items[plan.index];
-      if (!item) continue;
-      if (plan.type === 'essay') {
-        const textarea = item.querySelector('textarea');
-        if (!textarea) continue;
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-        setter.call(textarea, plan.answer);
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
-        textarea.dispatchEvent(new Event('change', { bubbles: true }));
-        count++;
-        continue;
-      }
-      const wanted = Array.isArray(plan.answer) ? plan.answer : [plan.answer];
-      const options = Array.from(item.querySelectorAll('.el-radio, .ant-radio-wrapper, .el-checkbox, .ant-checkbox-wrapper, [class*="radio-wrapper"], [class*="checkbox-wrapper"]'));
-      const unique = [];
-      const seen = new Set();
-      options.forEach((el, optionIndex) => {
-        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        const key = text.match(/^([A-Z])[\.、\s]/i)?.[1]?.toUpperCase() || String.fromCharCode(65 + optionIndex);
-        if (!seen.has(key)) { seen.add(key); unique.push({ el, key }); }
-      });
-      let selected = 0;
-      for (const option of unique) {
-        if (!wanted.includes(option.key)) continue;
-        const input = option.el.querySelector('input');
-        if (input && !input.checked) input.click();
-        else if (!input) option.el.click();
-        selected++;
-      }
-      if (selected === wanted.length) count++;
-    }
-    return count;
-  }, plan);
-
-  if (applied !== questions.length) throw new Error(`Only applied ${applied}/${questions.length} AI answers`);
-  emit('ai_answers_applied', { model: ai.model, count: applied, answers: plan.map(({ index, type, answer }) => ({ index, type, answer })) });
+  const applied = await applyAnswerPlan(context.frame, plan);
+  emit('ai_answers_applied', { model: ai.model, ...applied, answers: plan.map(({ index, type, answer }) => ({ index, type, answer })) });
+  if (applied.mismatched.length > 0) {
+    log(`⚠️ ${applied.mismatched.length} 道题作答状态与预期不一致：${JSON.stringify(applied.mismatched)}`, 'warn');
+  }
 
   const submit = await context.frame.evaluate(() => {
     const buttons = Array.from(document.querySelectorAll('button, .el-button, .ant-btn')).filter(button => button.offsetParent !== null && !button.disabled);
@@ -1499,9 +1699,28 @@ async function answerPostTestWithAI(page) {
     return { clicked: true, text: (target.textContent || '').trim() };
   });
   if (!submit.clicked) throw new Error('Post-test submit button not found');
-  await sleep(3000);
+  await sleep(4000);
   emit('posttest_submitted', { ...submit, model: ai.model });
-  return { found: true, submitted: true, model: ai.model, count: questions.length };
+
+  // 读分数：页面会显示"测试成绩50.0分。还有 3 次重测机会。"
+  const score = await readTestScore(page);
+  emit('posttest_score', score);
+  log(`课后测试成绩：${score.score ?? '未知'} 分，剩余重测机会 ${score.retakes ?? '未知'}`, score.score === null ? 'warn' : 'info');
+  return { found: true, submitted: true, model: ai.model, count: questions.length, score: score.score, retakes: score.retakes };
+}
+
+// 读取交卷后的成绩与剩余重测次数（平台文案："测试成绩50.0分。还有 3 次重测机会。"）
+async function readTestScore(page) {
+  for (let i = 0; i < 10; i++) {
+    const text = await page.evaluate(() => (document.body?.innerText || '')).catch(() => '');
+    const scoreMatch = text.match(/测试成绩\s*([\d.]+)\s*分/);
+    const retakeMatch = text.match(/还有\s*(\d+)\s*次重测机会/);
+    if (scoreMatch) {
+      return { score: parseFloat(scoreMatch[1]), retakes: retakeMatch ? parseInt(retakeMatch[1], 10) : null, text: text.slice(0, 200) };
+    }
+    await sleep(1500);
+  }
+  return { score: null, retakes: null, reason: 'score_not_found' };
 }
 
 async function testAiConnection() {
@@ -1523,6 +1742,200 @@ async function testAiConnection() {
 // 一键全自动
 // ============================================================
 
+// 只读诊断：dump 课后测试页的真实 DOM 结构。
+// 不答题、不提交、不消耗考试机会——只回答两个问题：
+//   ① 多选题的选项到底是什么元素（radio 还是 checkbox、input 是否隐藏）
+//   ② 用现有逻辑点击后，选中状态能不能真的写进去（DOM + Vue 两层都看）
+async function dumpTestDom(page) {
+  for (const frame of page.frames()) {
+    if (/7moor|moor_chat|webchat/i.test(frame.url())) continue;
+    try {
+      const result = await frame.evaluate(async () => {
+        const visible = el => !!el && el.offsetParent !== null;
+        const all = Array.from(document.querySelectorAll('.course-test-type-list-item, [class*="course-test-type-list-item"], [class*="question-item"]'));
+        const items = all.filter(item => visible(item) && !all.some(o => o !== item && o.contains(item)));
+        if (items.length === 0) return null;
+
+        const questions = items.map((item, index) => {
+          const titleEl = item.querySelector('.course-test-type-list-item-title-content, [class*="question-title"], [class*="title"]');
+          const stem = (titleEl?.textContent || item.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+          const optEls = Array.from(item.querySelectorAll('.el-radio, .ant-radio-wrapper, .el-checkbox, .ant-checkbox-wrapper, [class*="radio-wrapper"], [class*="checkbox-wrapper"]'));
+          const hasCheckbox = !!item.querySelector('.el-checkbox, .ant-checkbox-wrapper, [class*="checkbox-wrapper"]');
+          const options = optEls.slice(0, 6).map((el, i) => {
+            const input = el.querySelector('input');
+            const cs = input ? getComputedStyle(input) : null;
+            return {
+              i,
+              tag: el.tagName,
+              cls: (el.className || '').toString().slice(0, 70),
+              inputType: input ? input.type : null,
+              inputHidden: cs ? (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') : null,
+              text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 30),
+            };
+          });
+          return {
+            index,
+            stem,
+            detectedType: hasCheckbox ? 'multiple' : 'single',
+            optionCount: optEls.length,
+            options,
+            firstOptionHtml: optEls[0] ? optEls[0].outerHTML.replace(/\s+/g, ' ').slice(0, 400) : null,
+            hasVue: !!(item.__vue__ || (optEls[0] && optEls[0].__vue__)),
+          };
+        });
+
+        // 点击试验：找第一道多选题，用现有逻辑点前两个选项，回读选中状态
+        let clickTest = null;
+        const multiIdx = questions.findIndex(q => q.detectedType === 'multiple');
+        if (multiIdx >= 0) {
+          const item = items[multiIdx];
+          const optEls = Array.from(item.querySelectorAll('.el-checkbox, .ant-checkbox-wrapper, [class*="checkbox-wrapper"], .el-radio, [class*="radio-wrapper"]'));
+          const readState = () => optEls.map(el => {
+            const input = el.querySelector('input');
+            return {
+              domChecked: input ? input.checked : null,
+              clsChecked: /is-checked|checked|ant-checkbox-checked/i.test((el.className || '').toString()),
+            };
+          });
+          const before = readState();
+          for (const el of optEls.slice(0, 2)) {
+            const input = el.querySelector('input');
+            if (input) input.click();
+            else el.click();
+          }
+          await new Promise(r => setTimeout(r, 500));
+          const after = readState();
+
+          // Vue 层：看组件数据里到底存了什么
+          let vueData = null;
+          try {
+            const vm = item.__vue__ || (optEls[0] && optEls[0].__vue__);
+            if (vm) {
+              const keys = Object.keys(vm.$data || {}).filter(k => /answer|select|check|value|option|result/i.test(k));
+              vueData = { keys, sample: {} };
+              for (const k of keys.slice(0, 8)) {
+                const v = vm.$data[k];
+                vueData.sample[k] = typeof v === 'object' ? JSON.stringify(v).slice(0, 200) : String(v).slice(0, 100);
+              }
+            }
+          } catch (e) {
+            vueData = { error: String(e.message).slice(0, 120) };
+          }
+
+          clickTest = { questionIndex: multiIdx, optionCount: optEls.length, before, after, vueData };
+        }
+        return { url: location.href, pageText: (document.body?.innerText || '').slice(0, 200), questions, clickTest };
+      });
+      if (result) return result;
+    } catch {}
+  }
+  return null;
+}
+
+async function dumpTest(keyword) {
+  if (!keyword) {
+    log('用法: node agent.js dump-test <keyword>', 'error');
+    return;
+  }
+  loadEnv();
+  const browser = await launchBrowser(false);
+  try {
+    const courseListPage = await getOrCreatePage(browser);
+    emit('phase', { phase: 'login' });
+    if (!await ensureLoggedIn(courseListPage)) throw new Error('Login failed');
+
+    const courses = await scrapeCourses(courseListPage);
+    const course = courses.find(c => c.title.toLowerCase().includes(keyword.toLowerCase()));
+    if (!course) {
+      log(`未匹配到课程: ${keyword}`, 'error');
+      log(`课表: ${courses.map(c => c.title).join(' | ')}`, 'info');
+      return;
+    }
+    log(`匹配: ${course.title}（${course.progress}）`, 'success');
+    const page = await openCoursePage(browser, courseListPage, course);
+    await sleep(5000);
+    const dump = await dumpTestDom(page);
+    if (!dump) {
+      log('测试页未找到题目（可能不在答题页）', 'error');
+      const text = await page.evaluate(() => (document.body?.innerText || '').slice(0, 600)).catch(() => '');
+      log(`页面文本: ${text}`, 'info');
+      return;
+    }
+    emit('dump_test', dump);
+    console.log('\n===== DUMP TEST =====');
+    console.log(JSON.stringify(dump, null, 2));
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// 空跑验证：抽取题目 → AI 作答 → 用新逻辑写入 → 回读校验，全程不点提交。
+// 补考次数有限，必须先在这里确认多选能真正选中，再拿真实考试去跑。
+async function dryTest(keyword) {
+  if (!keyword) {
+    log('用法: node agent.js dry-test <keyword>', 'error');
+    return;
+  }
+  loadEnv();
+  const browser = await launchBrowser(false);
+  try {
+    const courseListPage = await getOrCreatePage(browser);
+    if (!await ensureLoggedIn(courseListPage)) throw new Error('Login failed');
+    const courses = await scrapeCourses(courseListPage);
+    const course = courses.find(c => c.title.toLowerCase().includes(keyword.toLowerCase()));
+    if (!course) {
+      log(`未匹配到课程: ${keyword}`, 'error');
+      return;
+    }
+    log(`匹配: ${course.title}（${course.progress}）`, 'success');
+    const page = await openCoursePage(browser, courseListPage, course);
+    await sleep(5000);
+
+    await dismissExpiredModal(page);
+    const context = await extractPostTestQuestions(page);
+    if (context.questions.length === 0) {
+      log('未找到题目（当前页面可能不是答题页）', 'error');
+      log(`页面文本: ${(await page.evaluate(() => (document.body?.innerText || '').slice(0, 300)).catch(() => ''))}`, 'info');
+      return;
+    }
+    log(`题目所在 frame: ${context.frame === page.mainFrame() ? '主框架' : context.frame.url().slice(0, 120)}`, 'info');
+    log(`页面文本: ${(await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 260)).catch(() => ''))}`, 'info');
+    const buttons = await page.evaluate(() => Array.from(document.querySelectorAll('button, .el-button, .ant-btn'))
+      .filter(b => b.offsetParent !== null).map(b => (b.textContent || '').replace(/\s+/g, '').trim()).filter(Boolean).slice(0, 25)).catch(() => []);
+    log(`页面按钮: ${JSON.stringify(buttons)}`, 'info');
+    emit('questions_extracted', { count: context.questions.length, questions: context.questions });
+    log(`抽取 ${context.questions.length} 题，调用 AI...`, 'info');
+
+    const ai = await callAiForQuestions(context.questions);
+    const plan = buildAnswerPlan(context.questions, ai.answers);
+    log('AI 答案:', 'info');
+    for (const p of plan) {
+      log(`  [${p.index}] ${p.type} → ${Array.isArray(p.answer) ? p.answer.join('') : p.answer}`, 'info');
+    }
+
+    const applied = await applyAnswerPlan(context.frame, plan);
+    emit('dry_run_result', applied);
+    log(`\n===== 空跑结果（未提交）=====`, applied.mismatched.length === 0 ? 'success' : 'warn');
+    log(`一致 ${applied.count}/${applied.total} 题`, applied.mismatched.length === 0 ? 'success' : 'warn');
+    log(`点击轮次: ${JSON.stringify(applied.rounds)}`, 'info');
+    if (applied.mismatched.length > 0) {
+      log(`不一致明细: ${JSON.stringify(applied.mismatched, null, 2)}`, 'error');
+    }
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// 课程页是否已停在「课后测试」答题页：学习部分早就完成，只差交卷。
+// 这类页面没有视频也没有章节目录，必须就地答题，不能再走章节学习流程。
+async function isPostTestPage(page) {
+  return page.evaluate(() => {
+    const t = document.body?.innerText || '';
+    if (!/课后测试倒计时|这是您第\s*\d+\s*次课后测试|您一共有\s*\d+\s*次考试机会/.test(t)) return false;
+    return document.querySelectorAll('video, audio').length === 0;
+  }).catch(() => false);
+}
+
 // 修复版主流程：接管新标签页、逐章节学习、AI 课后测试、严格完成验证。
 // 完成单门课程（调用方负责浏览器生命周期、登录与课表抓取）
 async function completeOneCourse(browser, courseListPage, course, rate) {
@@ -1536,8 +1949,21 @@ async function completeOneCourse(browser, courseListPage, course, rate) {
   emit('course_frames_after_hook', { frames: await inspectFrames(coursePage) });
 
   emit('phase', { phase: 'learn_chapters', course: course.title });
-  const learned = await learnAllChapters(coursePage, rate);
-  if (!learned) throw new Error('Not all chapters were learned');
+  // 学习阶段已完成、页面直接停在课后测试页时，就地答题（避免离开再回来浪费一次考试机会）
+  let posttestHandled = false;
+  if (await isPostTestPage(coursePage)) {
+    log('课程已停在课后测试页，跳过章节学习，就地答题', 'success');
+    emit('learning_already_complete', { via: 'posttest_page' });
+    emit('phase', { phase: 'posttest', course: course.title });
+    const posttest = await answerPostTestWithAI(coursePage);
+    posttestHandled = true;
+    emit(posttest.submitted ? 'posttest_submitted' : 'posttest_result', posttest);
+    if (posttest.found && !posttest.submitted) throw new Error(`Post-test was not submitted: ${posttest.reason}`);
+    if (!posttest.found) emit('posttest_skipped', { reason: 'no_questions' });
+  } else {
+    const learned = await learnAllChapters(coursePage, rate);
+    if (!learned) throw new Error('Not all chapters were learned');
+  }
 
   const requiresEvaluation = /课程评估|Course Evaluation/i.test(course.fullText || '');
   emit('phase', { phase: 'goto_eval', course: course.title });
@@ -1555,12 +1981,14 @@ async function completeOneCourse(browser, courseListPage, course, rate) {
   }
 
   // 评估提交后，测试可能自动出现，也可能需要显式点击步骤。
-  emit('phase', { phase: 'posttest', course: course.title });
-  const posttestStep = await clickCourseStep(coursePage, ['课后测试', 'Post-test', 'Post Test']);
-  emit('step_clicked', { step: 'posttest', ...posttestStep });
-  const posttest = await answerPostTestWithAI(coursePage);
-  if (posttest.found && !posttest.submitted) throw new Error(`Post-test was not submitted: ${posttest.reason}`);
-  if (!posttest.found) emit('posttest_skipped', { reason: 'no_questions' });
+  if (!posttestHandled) {
+    emit('phase', { phase: 'posttest', course: course.title });
+    const posttestStep = await clickCourseStep(coursePage, ['课后测试', 'Post-test', 'Post Test']);
+    emit('step_clicked', { step: 'posttest', ...posttestStep });
+    const posttest = await answerPostTestWithAI(coursePage);
+    if (posttest.found && !posttest.submitted) throw new Error(`Post-test was not submitted: ${posttest.reason}`);
+    if (!posttest.found) emit('posttest_skipped', { reason: 'no_questions' });
+  }
 
   emit('phase', { phase: 'verify', course: course.title });
   let verifiedCourse = null;
@@ -2051,6 +2479,12 @@ async function main() {
     case 'dump-eval':
       await dumpEval(args[1]);
       break;
+    case 'dump-test':
+      await dumpTest(args[1]);
+      break;
+    case 'dry-test':
+      await dryTest(args[1]);
+      break;
     case 'run-all':
       await runAllCourses(args.indexOf('--rate') >= 0 ? parseInt(args[args.indexOf('--rate') + 1]) : 4,
         args.indexOf('--rounds') >= 0 ? parseInt(args[args.indexOf('--rounds') + 1]) : 3);
@@ -2073,6 +2507,8 @@ Commands:
   run-all [--rate N] [--rounds N]  一次登录串行完成课表里所有未完成课程（推荐）
   diag-rate <关键词> [秒数]   诊断倍速：对比 1x/4x 实际前进量 + 探测 aliplayer API
   dump-eval <keyword>         走完整流程并 dump 评估页 DOM（用于排查评估提交失败）
+  dump-test <keyword>         只读 dump 课后测试页 DOM + 多选点击试验（不提交，排查多选作答无效）
+  dry-test <keyword>          空跑答题：AI 作答并写入页面后回读校验，不提交（验证多选是否真的选上）
   test-ai                    验证课后测试 AI 配置与返回格式
 
 Environment (.env / .env.local):
