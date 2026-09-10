@@ -83,22 +83,32 @@ async function launchBrowser(headless = false) {
 // 任何 goto 后必须调用——否则后续操作会被弹窗遮挡全部失败
 async function dismissExpiredModal(page, maxRetries = 3) {
   for (let i = 0; i < maxRetries; i++) {
-    const has = await page.evaluate(() => {
-      const t = document.body?.innerText || '';
-      return /登录已超时|请重新登录|账号在其他设备|在其他设备登录/.test(t);
-    });
+    // reload/导航后旧 frame 会被销毁，evaluate 会抛 "detached Frame"——必须容错，否则整轮崩溃
+    let has = false;
+    try {
+      has = await page.evaluate(() => {
+        const t = document.body?.innerText || '';
+        return /登录已超时|请重新登录|账号在其他设备|在其他设备登录/.test(t);
+      });
+    } catch {
+      return false;
+    }
     if (!has) return false;
     log(`⚠️  检测到登录超时弹窗（第 ${i + 1} 次），点"确定"...`, 'warn');
-    await page.evaluate(() => {
-      const btns = document.querySelectorAll('button, .el-button, .ant-btn, .el-button--primary');
-      for (const b of btns) {
-        const t = (b.textContent || '').trim();
-        if (t === '确定' || t === '确 定' || t === '重新登录') {
-          b.click();
-          return;
+    try {
+      await page.evaluate(() => {
+        const btns = document.querySelectorAll('button, .el-button, .ant-btn, .el-button--primary');
+        for (const b of btns) {
+          const t = (b.textContent || '').trim();
+          if (t === '确定' || t === '确 定' || t === '重新登录') {
+            b.click();
+            return;
+          }
         }
-      }
-    });
+      });
+    } catch {
+      return true;
+    }
     await sleep(2000);
   }
   return true; // 出现过弹窗
@@ -109,32 +119,208 @@ async function getOrCreatePage(browser) {
   return pages[0] || await browser.newPage();
 }
 
-// 文档课专用：注入 32x 加速 hook（在 runAll 探测到文档课后调用）
+// ============================================================
+// 页面内常驻学习助手（混合架构的核心）
+//
+// 设计原则：加速这件事必须"一直在场"，交给页面内 setInterval；
+// Node 只做编排（登录/选课/切章/评估）和只读状态，不再高频操作 DOM。
+//
+// 相比旧的"hook 全局 setInterval/setTimeout"做法：
+//   - 不污染页面其它定时器（旧做法破坏过 aliplayer 进度上报，导致视频 0-12s 循环）
+//   - 文档课直接改 Vue 组件 $data.recordTime（平台判定字段），精准无副作用
+//   - play() 回调里立即重设 playbackRate，不会掉回 1x
+//   - 1 秒巡检不会"错过"播放器瞬时重建，杜绝"采样不到视频"误判
+// ============================================================
+
+const STUDY_HELPER_INSTALLER = () => {
+  if (window.__TBH__) return;
+  window.__TBH__ = (function () {
+    const S = {
+      v: '3.0', running: false, mode: null,
+      rate: 2, docSpeed: 30,
+      video: null, doc: null,
+      completed: false, completedReason: null,
+      ticks: 0, rateResets: 0, resumes: 0, docTicks: 0,
+      startedAt: 0, lastAdvanceAt: 0, maxCur: 0,
+      timer: null,
+    };
+
+    // 放宽选取：播放器重建/祖先 fixed 时 offsetParent 会为 null
+    // 音频课（type: mp3）只有 <audio> 没有 <video>，必须一起找，否则会退化成只推 recordTime
+    function pickVideo() {
+      const all = document.querySelectorAll('video, audio');
+      for (let i = 0; i < all.length; i++) {
+        const v = all[i];
+        if (v.offsetParent !== null || v.clientWidth > 0) return v;
+      }
+      return all.length ? all[0] : null;
+    }
+
+    // 找 Vue 组件树里 name === 'course-play' 的实例（文档/音频课判定数据挂在它上面）
+    // 性能关键：早期版本每秒都全量 querySelectorAll('*')，把页面直接拖死（日志卡在 recordTime 750 不动）。
+    // 改为：缓存命中 + 全局扫描节流（3s 一次）+ 扫描上限。
+    let cachedVm = null;
+    let lastFullScanAt = 0;
+
+    function vmMatches(vm) {
+      let d = 0;
+      while (vm && d < 20) {
+        if (vm.$options && vm.$options.name === 'course-play') return true;
+        vm = vm.$parent; d++;
+      }
+      return false;
+    }
+
+    function findCoursePlayVm() {
+      if (cachedVm && cachedVm.$data && typeof cachedVm.$data.recordTime === 'number') return cachedVm;
+      const now = Date.now();
+      if (now - lastFullScanAt < 3000) return null;
+      lastFullScanAt = now;
+
+      // 快速路径：从 .tips-content 逐级向上
+      const tips = document.querySelector('.tips-content');
+      let el = tips;
+      let guard = 0;
+      while (el && guard++ < 30) {
+        if (el.__vue__ && vmMatches(el.__vue__)) {
+          cachedVm = el.__vue__;
+          return cachedVm;
+        }
+        el = el.parentElement;
+      }
+      // 兜底：有限全局扫描
+      const all = document.querySelectorAll('*');
+      const limit = Math.min(all.length, 3000);
+      for (let i = 0; i < limit; i++) {
+        if (all[i].__vue__ && vmMatches(all[i].__vue__)) {
+          cachedVm = all[i].__vue__;
+          return cachedVm;
+        }
+      }
+      return null;
+    }
+
+    function tick() {
+      S.ticks++;
+      const v = pickVideo();
+      if (v) {
+        S.mode = 'video';
+        try { v.muted = true; } catch (e) {}
+        // 维持倍速：播放器重建后 playbackRate 会掉回 1
+        if (v.playbackRate !== S.rate) {
+          try { v.playbackRate = S.rate; S.rateResets++; } catch (e) {}
+        }
+        // 暂停则续播——关键：在 play() 的回调里立即重设倍速
+        if (v.paused && !v.ended) {
+          S.resumes++;
+          try {
+            const p = v.play();
+            if (p && p.then) {
+              p.then(() => { try { v.playbackRate = S.rate; } catch (e) {} }).catch(() => {});
+            }
+          } catch (e) {}
+        }
+        const cur = v.currentTime || 0;
+        const dur = v.duration || 0;
+        if (cur > S.maxCur + 0.5) { S.maxCur = cur; S.lastAdvanceAt = Date.now(); }
+        S.video = {
+          cur: +cur.toFixed(1), dur: +dur.toFixed(1),
+          rate: v.playbackRate, paused: v.paused, ended: v.ended, readyState: v.readyState,
+        };
+        if (v.ended || (dur > 0 && dur - cur < 5)) {
+          S.completed = true;
+          S.completedReason = 'video_end';
+        }
+        return;
+      }
+
+      S.video = null;
+      // 文档课：直接推进平台用于判定的 recordTime
+      const vm = findCoursePlayVm();
+      if (vm && vm.$data && typeof vm.$data.recordTime === 'number') {
+        S.mode = 'document';
+        const min = typeof vm.$data.minStudyTime === 'number' ? vm.$data.minStudyTime : 900;
+        if (vm.$data.recordTime < min) {
+          vm.$data.recordTime = Math.min(min, vm.$data.recordTime + S.docSpeed);
+          S.docTicks++;
+          S.lastAdvanceAt = Date.now();
+        } else {
+          S.completed = true;
+          S.completedReason = 'doc_recordTime_reached';
+        }
+        S.doc = { recordTime: vm.$data.recordTime, minStudyTime: min };
+      }
+    }
+
+    return {
+      start(rate, docSpeed) {
+        if (rate) S.rate = rate;
+        if (docSpeed) S.docSpeed = docSpeed;
+        if (S.timer) clearInterval(S.timer);
+        S.running = true; S.completed = false; S.completedReason = null;
+        S.startedAt = Date.now(); S.lastAdvanceAt = Date.now(); S.maxCur = 0;
+        cachedVm = null; lastFullScanAt = 0;   // 新章节要重新找组件
+        tick();
+        S.timer = setInterval(tick, 1000);
+        return true;
+      },
+      stop() { if (S.timer) clearInterval(S.timer); S.timer = null; S.running = false; return true; },
+      setRate(r) {
+        S.rate = r;
+        const v = pickVideo();
+        if (v) { try { v.playbackRate = r; } catch (e) {} }
+        return true;
+      },
+      // 停滞救援：先 pause/play 重启解码，仍无效则跳到结尾前 20s 用 2x 播完
+      nudge() {
+        const v = pickVideo();
+        if (!v) return 'no_media';
+        try {
+          if (v.duration > 0 && v.currentTime < v.duration - 30) {
+            v.pause();
+            const target = Math.max(0, v.duration - 20);
+            v.currentTime = target;
+            v.playbackRate = Math.min(S.rate, 2);
+            v.play().catch(() => {});
+            S.lastAdvanceAt = Date.now();
+            return 'seek_to_' + Math.round(target);
+          }
+          v.pause();
+          setTimeout(() => { try { v.playbackRate = S.rate; v.play().catch(() => {}); } catch (e) {} }, 600);
+          S.lastAdvanceAt = Date.now();
+          return 'restart';
+        } catch (e) {
+          return 'error';
+        }
+      },
+      reset() {
+        S.completed = false; S.completedReason = null; S.maxCur = 0; S.lastAdvanceAt = Date.now();
+        cachedVm = null; lastFullScanAt = 0;
+        return true;
+      },
+      snapshot() {
+        return {
+          v: S.v, running: S.running, mode: S.mode, rate: S.rate,
+          video: S.video, doc: S.doc,
+          completed: S.completed, completedReason: S.completedReason,
+          ticks: S.ticks, rateResets: S.rateResets, resumes: S.resumes, docTicks: S.docTicks,
+          maxCur: +S.maxCur.toFixed(1),
+          elapsedMs: S.startedAt ? Date.now() - S.startedAt : 0,
+          sinceAdvanceMs: S.lastAdvanceAt ? Date.now() - S.lastAdvanceAt : -1,
+        };
+      },
+    };
+  })();
+};
+
+async function installStudyHelper(page) {
+  await page.evaluateOnNewDocument(STUDY_HELPER_INSTALLER);
+  await page.evaluate(STUDY_HELPER_INSTALLER).catch(() => {});
+}
+
+// 兼容旧调用点：统一走新的常驻助手（不再 hook 全局定时器）
 async function installDocSpeedupHook(page) {
-  if (page.__TBH_DOC_HOOK_INSTALLED__) return;
-  page.__TBH_DOC_HOOK_INSTALLED__ = true;
-  const installer = () => {
-    if (window.__TBH_DOC_HOOK__) return;
-    window.__TBH_DOC_HOOK__ = true;
-    const origSetInterval = window.setInterval;
-    window.setInterval = function(fn, ms, ...args) {
-      if (typeof ms === 'number' && ms >= 1000) {
-        ms = Math.max(31, Math.floor(ms / 32));
-      }
-      return origSetInterval.call(this, fn, ms, ...args);
-    };
-    const origSetTimeout = window.setTimeout;
-    window.setTimeout = function(fn, ms, ...args) {
-      if (typeof ms === 'number' && ms >= 1000 && ms <= 60000) {
-        ms = Math.max(31, Math.floor(ms / 32));
-      }
-      return origSetTimeout.call(this, fn, ms, ...args);
-    };
-    console.log('[doc-speedup] 32x hook installed');
-  };
-  // 后续 document 仍自动安装；当前课程页则在 SPA 初始化完成后安装，避免破坏首屏启动。
-  await page.evaluateOnNewDocument(installer);
-  await page.evaluate(installer);
+  await installStudyHelper(page);
 }
 
 // ============================================================
@@ -533,7 +719,9 @@ async function callAiForQuestions(questions) {
   }
 }
 
-async function openCoursePage(browser, courseListPage, course) {
+// 在课表页点击目标课程卡，返回打开/跳转后的课程页（失败返回 { ok:false }）
+// 这是进入课程的唯一正当途径——不允许绕过课表直接 goto 课程 URL。
+async function clickCourseCard(browser, courseListPage, course) {
   const targetCard = await courseListPage.evaluate((targetTitle) => {
     for (const card of document.querySelectorAll('.nc-mycourse-card')) {
       if ((card.textContent || '').includes(targetTitle)) {
@@ -544,38 +732,80 @@ async function openCoursePage(browser, courseListPage, course) {
     return { found: false };
   }, course.title);
 
-  let coursePage = courseListPage;
-  if (targetCard.found) {
-    const newTargetPromise = browser.waitForTarget(
-      target => target.opener() === courseListPage.target(),
-      { timeout: 12000 }
-    ).catch(() => null);
-    try {
-      await courseListPage.click(targetCard.selector, { timeout: 5000 });
-      log(`✅ 已点击课表卡 (${targetCard.selector})`, 'success');
-      const newTarget = await newTargetPromise;
-      if (newTarget) {
-        const opened = await newTarget.page();
-        if (opened) {
-          coursePage = opened;
+  if (!targetCard.found) return { ok: false, reason: 'card_not_found' };
+
+  const newTargetPromise = browser.waitForTarget(
+    target => target.opener() === courseListPage.target(),
+    { timeout: 12000 }
+  ).catch(() => null);
+
+  try {
+    await courseListPage.click(targetCard.selector, { timeout: 5000 });
+    log(`✅ 已点击课表卡 (${targetCard.selector})`, 'success');
+    const newTarget = await newTargetPromise;
+    if (newTarget) {
+      const opened = await newTarget.page();
+      if (opened) {
+        await sleep(4000);
+        if (/\/courseSetting\/courseLearning\/play/i.test(opened.url())) {
           log('✅ 已接管课程新标签页', 'success');
+          return { ok: true, page: opened };
         }
       }
-      await sleep(4000);
-    } catch (e) {
-      log(`点击课程卡失败: ${e.message}`, 'warn');
     }
+    await sleep(4000);
+    // 同一标签页内跳转的情况
+    if (/\/courseSetting\/courseLearning\/play/i.test(courseListPage.url())) {
+      log('✅ 课表页已跳转至课程页', 'success');
+      return { ok: true, page: courseListPage };
+    }
+  } catch (e) {
+    log(`点击课程卡失败: ${e.message}`, 'warn');
+  }
+  return { ok: false, reason: 'click_no_navigation' };
+}
+
+async function openCoursePage(browser, courseListPage, course) {
+  const courseUrl = `https://v4.21tb.com/courseSetting/courseLearning/play?courseType=NEW_COURSE_CENTER&courseId=${course.id}`;
+  // 进入课程的严格顺序：
+  //   ① 已登录的课表页点卡
+  //   ② 点卡失败 → 重新登录（重建 session）→ 再点卡
+  //   ③ 仍失败 → 才允许 goto 课程 URL（此时 session 已由 ② 建立，不会再弹"登录已超时"）
+  let attempt = await clickCourseCard(browser, courseListPage, course);
+  if (!attempt.ok) {
+    log(`点课表卡未进入课程（${attempt.reason}），先重新登录再点一次`, 'warn');
+    emit('course_card_retry_after_relogin', { reason: attempt.reason });
+    await ensureLoggedIn(courseListPage);
+    await scrapeCourses(courseListPage);
+    attempt = await clickCourseCard(browser, courseListPage, course);
   }
 
-  const isCourseUrl = /\/courseSetting\/courseLearning\/play/i.test(coursePage.url());
-  if (!isCourseUrl) {
-    const courseUrl = `https://v4.21tb.com/courseSetting/courseLearning/play?courseType=NEW_COURSE_CENTER&courseId=${course.id}`;
-    log('未得到有效课程页，使用课程 URL 兜底', 'warn');
+  let coursePage = attempt.ok ? attempt.page : null;
+  if (!coursePage) {
+    log('两次点卡均未进入课程，使用课程 URL 兜底（session 已就绪）', 'warn');
     coursePage = courseListPage;
     await coursePage.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   }
+  // 课程页是新标签时默认不在前台，Chrome 会把它的 setInterval 节流到分钟级，
+  // 页面内助手就跑不动（文档/音频课 recordTime 会卡住）。必须激活。
+  await coursePage.bringToFront().catch(() => {});
+
+  // 若被"登录已超时"弹窗拦下，说明 session 在中途失效：重登 → 回课表 → 重新点卡（最多 2 轮）
+  for (let guard = 1; guard <= 2; guard++) {
+    const kicked = await dismissExpiredModal(coursePage);
+    if (!kicked) break;
+    log(`课程页被登录超时弹窗拦截（第 ${guard} 轮），重新登录后重进课程`, 'warn');
+    emit('course_page_relogin', { guard });
+    await ensureLoggedIn(courseListPage);
+    await scrapeCourses(courseListPage);
+    attempt = await clickCourseCard(browser, courseListPage, course);
+    if (attempt.ok) { coursePage = attempt.page; continue; }
+    if (coursePage !== courseListPage) { try { await coursePage.close(); } catch {} }
+    coursePage = courseListPage;
+    await coursePage.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  }
+
   coursePage.setDefaultTimeout(30000);
-  await dismissExpiredModal(coursePage);
   let ready = null;
   for (let loadAttempt = 1; loadAttempt <= 2; loadAttempt++) {
     for (let attempt = 1; attempt <= 15; attempt++) {
@@ -706,16 +936,22 @@ async function selectChapter(page, catalog, index) {
       const courseData = component?.$data?.courseData || component?.courseData;
       const resource = courseData?.[chapterIdx]?.resourceDTOS?.[sectionIdx];
       if (!component || !resource) return false;
-      if (typeof component.checkoutSection === 'function') {
-        component.checkoutSection(resource, chapterIdx, sectionIdx);
-        return 'checkoutSection';
-      }
-      if (typeof component.jumpPeriod === 'function') {
-        component.jumpPeriod(resource, chapterIdx, sectionIdx);
-        return 'jumpPeriod';
+      // checkoutSection 在文档章节会对 null 播放器读 .duration 抛异常——
+      // 但切换其实已经生效，必须吞掉异常，否则整轮崩掉
+      try {
+        if (typeof component.checkoutSection === 'function') {
+          component.checkoutSection(resource, chapterIdx, sectionIdx);
+          return 'checkoutSection';
+        }
+        if (typeof component.jumpPeriod === 'function') {
+          component.jumpPeriod(resource, chapterIdx, sectionIdx);
+          return 'jumpPeriod';
+        }
+      } catch (e) {
+        return 'checkoutSection(threw:' + (e && e.message ? e.message.slice(0, 60) : 'unknown') + ')';
       }
       return false;
-    }, target);
+    }, target).catch(() => false);
     if (switched) {
       emit('chapter_switched', { index, via: switched, chapter: target });
       for (let attempt = 1; attempt <= 10; attempt++) {
@@ -727,10 +963,20 @@ async function selectChapter(page, catalog, index) {
           return true;
         }
       }
-      emit('chapter_switch_failed', { index, chapter: target });
-      return false;
+      // vue 路径没确认成功（音频/文档章节常见 checkoutSection 抛异常）——回退到 DOM 点击
+      emit('chapter_switch_failed', { index, chapter: target, note: 'vue 路径未确认，回退 DOM 点击' });
     }
-    return false;
+  }
+  // vue 模式下 catalog.selector 是空串，回退 DOM 点击前先探测一个可用的章节卡片选择器
+  if (!catalog.selector) {
+    for (const sel of ['.chapter-box', '.chapter-item', '.chapter', '.section-item', '.catalogue-item']) {
+      const n = await page.evaluate(s => document.querySelectorAll(s).length, sel).catch(() => 0);
+      if (n >= catalog.items.length) {
+        catalog = { ...catalog, selector: sel };
+        log(`章节切换回退：使用 DOM 选择器 ${sel}（${n} 项）`, 'warn');
+        break;
+      }
+    }
   }
   if (!catalog.selector) return false;
   const clicked = await frame.evaluate(({ selector, index }) => {
@@ -740,8 +986,9 @@ async function selectChapter(page, catalog, index) {
     item.scrollIntoView({ block: 'center' });
     item.click();
     return true;
-  }, { selector: catalog.selector, index });
-  if (clicked) await sleep(3000);
+  }, { selector: catalog.selector, index }).catch(() => false);
+  // 章节切换后播放器需要时间初始化，等短了会被误判成"视频消失"
+  if (clicked) await sleep(8000);
   return clicked;
 }
 
@@ -751,8 +998,11 @@ async function getLearningState(page) {
     if (/7moor|moor_chat|webchat/i.test(frame.url())) continue;
     try {
       const state = await frame.evaluate(() => {
-        const videos = Array.from(document.querySelectorAll('video')).filter(v => v.offsetParent !== null || v.clientWidth > 0);
-        const video = videos[0] || null;
+        // 放宽 video 选取：播放器重建元素/祖先 fixed 定位时 offsetParent 会为 null，
+        // 只要 DOM 里存在 video 就认，否则会被误判成"视频消失"进而无谓刷新页面。
+        const all = Array.from(document.querySelectorAll('video'));
+        const visible = all.filter(v => v.offsetParent !== null || v.clientWidth > 0);
+        const video = visible[0] || all[0] || null;
         const text = document.body?.innerText || '';
         const match = text.match(/还需观看\s*(\d+):(\d+)/);
         return {
@@ -779,76 +1029,172 @@ async function getLearningState(page) {
 }
 
 async function learnCurrentChapter(page, chapter, rate) {
+  // 混合架构：播放/加速交给页面内常驻助手 window.__TBH__，
+  // 这里只做三件事：① 确保助手在跑 ② 只读状态 ③ 判断完成/超时。
+  // 不再操作 video DOM、不再 page.reload()——这两者正是此前所有异常的根因。
   const startedAt = Date.now();
-  let sawCountdown = false;
   let sawVideo = false;
-  let stableNoGate = 0;
-  let lastRemaining = null;
-  while (Date.now() - startedAt < 10 * 60 * 1000) {
-    const catalog = await getChapterCatalog(page);
-    const freshChapter = catalog.items.find(item =>
-      (chapter.resourceId && item.resourceId === chapter.resourceId) ||
-      (!chapter.resourceId && item.index === chapter.index)
-    );
-    if (freshChapter?.finished) {
-      return { ok: true, mode: sawVideo ? 'video' : 'document', reason: 'platform_finish_flag' };
-    }
-    const state = await getLearningState(page);
+  let sawDoc = false;
+  let noGateRounds = 0;
+  let lastLogAt = 0;
+  let completedRetries = 0;
+  let lastNudgeAt = 0;
+  // getChapterCatalog 会遍历所有 frame，很重——节流到 12s 一次，
+  // 完成判定主要由页面内助手负责，这里只是最终确认。
+  let lastCatalogCheckAt = 0;
 
-    if (state.hasVideo) {
-      sawVideo = true;
-      const mediaFrame = page.frames().find(frame => frame.url() === state.frameUrl) || page.mainFrame();
-      await mediaFrame.evaluate(r => {
-        const video = Array.from(document.querySelectorAll('video')).find(v => v.offsetParent !== null || v.clientWidth > 0);
-        if (!video) return;
-        video.muted = true;
-        video.playbackRate = r;
-        if (video.paused && !video.ended) video.play().catch(() => {});
-      }, rate);
-      const v = state.video;
-      if (v.ended || (v.duration > 0 && v.currentTime >= v.duration - 0.5)) {
-        await sleep(4000);
-        return { ok: true, mode: 'video', reason: 'video_ended' };
+  // 音频/视频章节切换后播放器要几秒才挂载。过早启动助手会让它找不到 audio/video
+  // 而退化成推 recordTime —— 平台不认这条路径（章节进度不涨）。先等播放器就绪。
+  for (let i = 0; i < 12; i++) {
+    const hasMedia = await page.evaluate(() => document.querySelectorAll('video, audio').length > 0).catch(() => false);
+    if (hasMedia) break;
+    await sleep(1500);
+  }
+
+  // 播放器可能挂在 iframe 里（"商业数据分析五部曲" 就是 video 在 iframe、主文档查不到）。
+  // 必须在每个 frame 里都启动助手，读状态时也要聚合所有 frame。
+  const visibleFrames = async () => page.frames().filter(f => !/7moor|moor_chat|webchat/i.test(f.url()));
+
+  // 对所有 frame 里的助手下达同一个指令（stop / reset / setRate）
+  const helperAll = async (fn, arg) => {
+    for (const frame of await visibleFrames()) {
+      await frame.evaluate(fn, arg).catch(() => {});
+    }
+  };
+
+  const ensureHelper = async () => {
+    const frames = await visibleFrames();
+    let any = false;
+    for (const frame of frames) {
+      const ok = await frame.evaluate(r => {
+        if (!window.__TBH__) return false;
+        window.__TBH__.start(r);
+        return true;
+      }, rate).catch(() => false);
+      if (ok) any = true;
+    }
+    if (!any) {
+      await installStudyHelper(page);
+      for (const frame of await visibleFrames()) {
+        await frame.evaluate(r => window.__TBH__ && window.__TBH__.start(r), rate).catch(() => {});
       }
-      const pct = v.duration > 0 ? Math.round(v.currentTime / v.duration * 100) : 0;
-      log(`章节 ${chapter.index + 1} 视频进度 ${pct}% (${Math.round(v.currentTime)}/${Math.round(v.duration)}s)`);
+    }
+  };
+  await ensureHelper();
+
+  while (Date.now() - startedAt < 20 * 60 * 1000) {
+    // ① 平台章节 finished 标记是最权威的完成信号（节流检查）
+    if (Date.now() - lastCatalogCheckAt > 12000) {
+      lastCatalogCheckAt = Date.now();
+      const catalog = await getChapterCatalog(page);
+      const freshChapter = catalog.items.find(item =>
+        (chapter.resourceId && item.resourceId === chapter.resourceId) ||
+        (!chapter.resourceId && item.index === chapter.index)
+      );
+      if (freshChapter?.finished) {
+        await helperAll(() => window.__TBH__ && window.__TBH__.stop());
+        return { ok: true, mode: sawVideo ? 'video' : (sawDoc ? 'document' : 'unknown'), reason: 'platform_finish_flag' };
+      }
+    }
+
+    // ② 只读快照：跨 frame 聚合，优先取"真在跑且有学习对象"的那个
+    let snap = null;
+    {
+      const frames = await visibleFrames();
+      const snaps = [];
+      for (const frame of frames) {
+        const s = await frame.evaluate(() => (window.__TBH__ ? window.__TBH__.snapshot() : null)).catch(() => null);
+        if (s) snaps.push(s);
+      }
+      const score = s => (s.mode === 'video' ? 100 : 0) + (s.mode === 'document' ? 50 : 0) + (s.running ? 10 : 0) + s.ticks / 1000;
+      snap = snaps.sort((a, b) => score(b) - score(a))[0] || null;
+    }
+    if (!snap || !snap.running) {
+      // 助手没在跑（导航后 __TBH__ 被重建，interval 丢失）→ 重新启动
+      noGateRounds++;
+      if (noGateRounds >= 2) await ensureHelper();
+      await sleep(2000);
+      continue;
+    }
+    noGateRounds = 0;
+    if (snap.mode === 'video') sawVideo = true;
+    if (snap.mode === 'document') sawDoc = true;
+
+    // ③ 助手判定完成
+    if (snap.completed) {
+      await sleep(4000);
+      const recheck = await getChapterCatalog(page);
+      const done = recheck.items.find(item =>
+        (chapter.resourceId && item.resourceId === chapter.resourceId) ||
+        (!chapter.resourceId && item.index === chapter.index)
+      );
+      if (done?.finished) {
+        await helperAll(() => window.__TBH__ && window.__TBH__.stop());
+        return { ok: true, mode: snap.mode || 'unknown', reason: snap.completedReason || 'helper_completed' };
+      }
+      // 助手说完成但平台不打标记：重试有限次后按完成处理，
+      // 否则会陷入"reset → 又立刻 completed → 再 recheck"的死循环（曾卡在 recordTime 750 不动）
+      completedRetries++;
+      if (completedRetries >= 3) {
+        log(`章节 ${chapter.index + 1} 助手判定完成但平台未标记，按完成处理继续下一章`, 'warn');
+        await helperAll(() => window.__TBH__ && window.__TBH__.stop());
+        return { ok: true, mode: snap.mode || 'unknown', reason: `${snap.completedReason || 'helper_completed'}_unconfirmed` };
+      }
+      await helperAll(() => window.__TBH__ && window.__TBH__.reset());
       await sleep(3000);
       continue;
     }
 
-    if (state.remaining !== null) {
-      sawCountdown = true;
-      lastRemaining = state.remaining;
-      stableNoGate = 0;
-      log(`章节 ${chapter.index + 1} 文档剩余 ${state.remaining}s`);
-      if (state.remaining <= 0) return { ok: true, mode: 'document', reason: 'countdown_zero' };
-      await sleep(1500);
-      continue;
+    // ④ 兜底：停滞救援。先降速；仍无进展则由助手内部 seek/重启（下限 2x，1x 会被平台自动 pause）
+    if (snap.sinceAdvanceMs > 60000 && snap.rate > 2) {
+      const next = Math.max(2, Math.floor(snap.rate / 2));
+      await helperAll(r => window.__TBH__ && window.__TBH__.setRate(r), next);
+      log(`  ↳ ${Math.round(snap.sinceAdvanceMs / 1000)}s 无进展，降速至 ${next}x`, 'warn');
+    }
+    if (snap.sinceAdvanceMs > 45000 && Date.now() - lastNudgeAt > 60000) {
+      lastNudgeAt = Date.now();
+      const acts = await Promise.all((await visibleFrames()).map(f =>
+        f.evaluate(() => (window.__TBH__ ? window.__TBH__.nudge() : null)).catch(() => null)
+      ));
+      log(`  ↳ ${Math.round(snap.sinceAdvanceMs / 1000)}s 无进展，执行停滞救援：${acts.find(a => a && a !== 'no_media') || 'no_media'}`, 'warn');
     }
 
-    if (sawCountdown) {
-      // iframe 加载时倒计时会短暂消失；只有已接近 0 才把消失视为完成。
-      if (lastRemaining !== null && lastRemaining <= 60) {
-        await sleep(3000);
-        const confirm = await getLearningState(page);
-        if (confirm.remaining === null) return { ok: true, mode: 'document', reason: 'countdown_completed' };
+    if (Date.now() - lastLogAt > 6000) {
+      lastLogAt = Date.now();
+      if (snap.mode === 'video' && snap.video) {
+        const pct = snap.video.dur > 0 ? Math.round(snap.video.cur / snap.video.dur * 100) : 0;
+        log(`章节 ${chapter.index + 1} 视频 ${pct}% (${snap.video.cur}/${snap.video.dur}s) rate=${snap.video.rate} 续播=${snap.resumes} 重设=${snap.rateResets}`);
+      } else if (snap.mode === 'document' && snap.doc) {
+        log(`章节 ${chapter.index + 1} 文档 recordTime ${snap.doc.recordTime}/${snap.doc.minStudyTime}s (推进 ${snap.docTicks} 次)`);
+      } else {
+        log(`章节 ${chapter.index + 1} 等待学习对象… (ticks=${snap.ticks})`, 'warn');
       }
-      await sleep(1000);
-      continue;
     }
-
-    if (!state.loading) stableNoGate++;
-    if (stableNoGate >= 15) {
-      return { ok: false, mode: sawVideo ? 'video' : 'unknown', reason: 'no_learning_gate' };
-    }
-    await sleep(2000);
+    await sleep(3000);
   }
-  return { ok: false, mode: sawVideo ? 'video' : 'document', reason: 'chapter_timeout' };
+  await helperAll(() => window.__TBH__ && window.__TBH__.stop());
+  return { ok: false, mode: sawVideo ? 'video' : (sawDoc ? 'document' : 'unknown'), reason: 'chapter_timeout' };
 }
 
 async function learnAllChapters(page, rate) {
+  // 平台可能已判定学习阶段完成并直接停在评估页（"恭喜您已经完成课程学习，请完成课程评估"）。
+  // 此时既没有章节目录也没有视频，必须识别出来并跳过，否则会误报 no_learning_gate。
+  const learningDone = async () => page.evaluate(() =>
+    /恭喜您已经完成课程学习|已完成课程学习|请完成课程评估|课程学习已完成/.test(document.body?.innerText || '')
+  );
+  if (await learningDone()) {
+    log('平台已判定课程学习完成，跳过章节学习，直接进入评估', 'success');
+    emit('learning_already_complete', {});
+    return true;
+  }
+
   let catalog = await getChapterCatalog(page);
   if (catalog.items.length === 0) {
+    if (await learningDone()) {
+      log('未发现章节目录，但平台已判定学习完成，直接进入评估', 'success');
+      emit('learning_already_complete', { via: 'no_catalog' });
+      return true;
+    }
     const opened = await page.evaluate(() => {
       const elements = Array.from(document.querySelectorAll('button, a, div, span, li')).filter(el => el.offsetParent !== null);
       const target = elements.find(el => (el.textContent || '').trim() === '目录' && el.children.length === 0);
@@ -875,7 +1221,19 @@ async function learnAllChapters(page, rate) {
   emit('chapters_detected', { total: catalog.items.length, chapters: catalog.items });
   for (let index = 0; index < catalog.items.length; index++) {
     catalog = await getChapterCatalog(page);
-    const chapter = catalog.items[index];
+    let chapter = catalog.items[index];
+    // 章节切换后目录会短暂消失/重渲染，别直接判失败——重新展开目录重试
+    for (let retry = 1; retry <= 3 && !chapter; retry++) {
+      log(`章节 ${index + 1} 暂不在目录中，第 ${retry} 次重试展开目录`, 'warn');
+      await page.evaluate(() => {
+        const el = Array.from(document.querySelectorAll('button, a, div, span, li')).find(
+          x => (x.textContent || '').trim() === '目录' && x.children.length === 0 && x.offsetParent !== null);
+        if (el) el.click();
+      });
+      await sleep(3000);
+      catalog = await getChapterCatalog(page);
+      chapter = catalog.items[index];
+    }
     if (!chapter) throw new Error(`Chapter ${index + 1} disappeared`);
     emit('chapter_start', { index, total: catalog.items.length, chapter });
     if (!chapter.active) {
@@ -1166,7 +1524,7 @@ async function testAiConnection() {
 // ============================================================
 
 // 修复版主流程：接管新标签页、逐章节学习、AI 课后测试、严格完成验证。
-async function runAll(keyword, rate = 16) {
+async function runAll(keyword, rate = 4) {
   loadEnv();
   if (!keyword) throw new Error('Usage: run <keyword>');
   if (!Number.isFinite(rate) || rate <= 0) throw new Error(`Invalid playback rate: ${rate}`);
@@ -1496,6 +1854,109 @@ async function dumpEval(keyword) {
 }
 
 // ============================================================
+// 倍速诊断：复用已验证的 login → 课表 → 点卡 链路，
+// 在第一章对比 1x / 4x 下 currentTime 的真实前进量，并探测 aliplayer 官方 API
+// 用法: node agent.js diag-rate <关键词> [每档观测秒数]
+// ============================================================
+
+const PROBE_FN = () => {
+  const found = [];
+  const names = ['player', 'aliPlayer', 'aliplayer', 'videoPlayer', 'myPlayer', '__player'];
+  for (const n of names) {
+    try {
+      const obj = window[n];
+      if (obj && typeof obj === 'object') {
+        const api = Object.getOwnPropertyNames(Object.getPrototypeOf(obj) || {});
+        found.push({
+          name: n,
+          hasSetSpeed: typeof obj.setSpeed === 'function',
+          hasSeek: typeof obj.seek === 'function',
+          hasGetCurrentTime: typeof obj.getCurrentTime === 'function',
+          speedNow: typeof obj.getSpeed === 'function' ? (obj.getSpeed() ?? null) : null,
+          curTime: typeof obj.getCurrentTime === 'function' ? (obj.getCurrentTime() ?? null) : null,
+          apiSample: api.slice(0, 40),
+        });
+      }
+    } catch {}
+  }
+  const videos = Array.from(document.querySelectorAll('video')).map(v => ({
+    cur: +v.currentTime.toFixed(1), dur: +(v.duration || 0).toFixed(1),
+    rate: v.playbackRate, paused: v.paused, rs: v.readyState, ns: v.networkState,
+    src: (v.currentSrc || v.src || '').slice(0, 50),
+  }));
+  return { windowPlayers: found, videos };
+};
+
+const SET_RATE_DIRECT = (r) => {
+  const all = Array.from(document.querySelectorAll('video'));
+  const v = all.find(x => x.offsetParent !== null || x.clientWidth > 0) || all[0];
+  if (!v) return false;
+  v.muted = true;
+  v.playbackRate = r;
+  if (v.paused && !v.ended) v.play().catch(() => {});
+  return true;
+};
+
+const GET_VIDEO_FN = () => {
+  const all = Array.from(document.querySelectorAll('video'));
+  const v = all.find(x => x.offsetParent !== null || x.clientWidth > 0) || all[0];
+  if (!v) return null;
+  return {
+    cur: +v.currentTime.toFixed(1), dur: +(v.duration || 0).toFixed(1),
+    rate: v.playbackRate, paused: v.paused, rs: v.readyState,
+  };
+};
+
+async function diagRate(keyword, observeSec = 30) {
+  loadEnv();
+  const browser = await launchBrowser(false);
+  try {
+    const courseListPage = await getOrCreatePage(browser);
+    await ensureLoggedIn(courseListPage);
+    const courses = await scrapeCourses(courseListPage);
+    const course = courses.find(item => item.title.includes(keyword));
+    if (!course) throw new Error(`No matching course: ${keyword}`);
+    log(`匹配课程: ${course.title} (${course.progress})`);
+    const coursePage = await openCoursePage(browser, courseListPage, course);
+
+    for (const f of coursePage.frames()) {
+      if (/7moor|moor_chat/i.test(f.url())) continue;
+      try {
+        const probe = await f.evaluate(PROBE_FN);
+        if (probe.windowPlayers.length || probe.videos.length) {
+          log(`FRAME ${f.url().slice(0, 60)}`);
+          log(`  players: ${JSON.stringify(probe.windowPlayers)}`);
+          log(`  videos : ${JSON.stringify(probe.videos)}`);
+          emit('diag_probe', { frameUrl: f.url().slice(0, 120), ...probe });
+        }
+      } catch {}
+    }
+
+    for (const rate of [1, 4]) {
+      const ok = await coursePage.evaluate(SET_RATE_DIRECT, rate).catch(() => false);
+      log(`===== 设为 ${rate}x (成功=${ok}) =====`);
+      const start = await coursePage.evaluate(GET_VIDEO_FN).catch(() => null);
+      log(`  起点: ${JSON.stringify(start)}`);
+      let last = start ? start.cur : 0;
+      const t0 = Date.now();
+      for (let i = 0; i < Math.ceil(observeSec / 5); i++) {
+        await sleep(5000);
+        const v = await coursePage.evaluate(GET_VIDEO_FN).catch(() => null);
+        if (!v) { log(`  [${i}] 无 video 元素`); continue; }
+        const d = v.cur - last; last = v.cur;
+        log(`  [${i}] cur=${v.cur}/${v.dur} rate=${v.rate} Δ=${d.toFixed(1)}s rs=${v.rs} paused=${v.paused}`);
+      }
+      const wall = (Date.now() - t0) / 1000;
+      const net = last - (start ? start.cur : 0);
+      log(`  ⇒ ${rate}x 观测 ${wall.toFixed(0)}s，净前进 ${net.toFixed(1)}s（有效倍速 ${(net / wall).toFixed(2)}x）`);
+      emit('diag_rate_result', { rate, wallSec: +wall.toFixed(1), netSec: +net.toFixed(1), effectiveRate: +(net / wall).toFixed(2) });
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+// ============================================================
 // 主入口
 // ============================================================
 
@@ -1521,12 +1982,17 @@ async function main() {
       break;
     case 'run': {
       const rateArg = args.indexOf('--rate');
-      const rate = rateArg >= 0 ? parseInt(args[rateArg + 1]) : 16;
+      // 默认 4x：实测 16x/8x 会触发平台限流，currentTime 被强制回退成"进度振荡"（卡在 168s/274s）
+      // 4x 实测有效倍速 3.89x 且能一路播完；1x 反而会被平台自动 pause
+      const rate = rateArg >= 0 ? parseInt(args[rateArg + 1]) : 4;
       await runAll(args[1], rate);
       break;
     }
     case 'dump-eval':
       await dumpEval(args[1]);
+      break;
+    case 'diag-rate':
+      await diagRate(args[1], parseInt(args[2] || '30'));
       break;
     case 'test-ai':
       await testAiConnection();
@@ -1539,7 +2005,8 @@ Commands:
   courses                     仅获取课表
   status                      获取当前页面状态
   screenshot                  截图保存
-  run <keyword> [--rate N]    一键全自动完成指定课程
+  run <keyword> [--rate N]    一键全自动完成指定课程（默认 8x）
+  diag-rate <关键词> [秒数]   诊断倍速：对比 1x/4x 实际前进量 + 探测 aliplayer API
   dump-eval <keyword>         走完整流程并 dump 评估页 DOM（用于排查评估提交失败）
   test-ai                    验证课后测试 AI 配置与返回格式
 
